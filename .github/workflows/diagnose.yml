@@ -26,7 +26,13 @@ jobs:
           region=$OCI_REGION
           key_file=/home/runner/.oci/oci_api_key.pem
           EOF
-          pip install oci -q
+          # 0. Runner clock + config sanity (clock skew >5min also gives 401)
+          echo "RUNNER_DATE_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          echo "REGION_IN_CONFIG=$(grep '^region=' ~/.oci/config | cut -d= -f2)"
+          echo "USER_LEN=$(echo -n "$OCI_USER" | wc -c) TENANCY_LEN=$(echo -n "$OCI_TENANCY" | wc -c) FP_LEN=$(echo -n "$OCI_FINGERPRINT" | wc -c)"
+          # Pin the SDK version that worked from Cloud Shell (2.190.0)
+          pip install oci==2.190.0 -q
+          echo "OCI_SDK_VERSION=$(python3 -c 'import oci; print(oci.__version__)')"
           # 1. Does the private-key secret match the fingerprint secret?
           FP=$(openssl pkey -in ~/.oci/oci_api_key.pem -pubout -outform DER 2>/dev/null | openssl md5 -c | awk '{print $2}')
           if [ "$FP" = "$OCI_FINGERPRINT" ]; then echo "KEY_FINGERPRINT_MATCH=true"; else echo "KEY_FINGERPRINT_MATCH=false"; fi

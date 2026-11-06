@@ -29,6 +29,7 @@ jobs:
           # 0. Runner clock + config sanity (clock skew >5min also gives 401)
           echo "RUNNER_DATE_UTC=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           echo "REGION_IN_CONFIG=$(grep '^region=' ~/.oci/config | cut -d= -f2)"
+          if [ "$OCI_REGION" = "ap-singapore-1" ]; then echo "REGION_MATCH=true"; else echo "REGION_MATCH=false"; fi
           echo "USER_LEN=$(echo -n "$OCI_USER" | wc -c) TENANCY_LEN=$(echo -n "$OCI_TENANCY" | wc -c) FP_LEN=$(echo -n "$OCI_FINGERPRINT" | wc -c)"
           # Pin the SDK version that worked from Cloud Shell (2.190.0)
           pip install oci==2.190.0 -q

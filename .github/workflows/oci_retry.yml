@@ -29,18 +29,16 @@ jobs:
       - name: Install OCI SDK
         run: pip install oci
 
-      - name: Set up Node (for OIDC exchange action)
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-
-      - name: Exchange GitHub OIDC token for OCI session token
-        uses: gtrevorrow/oci-token-exchange-action@v1
-        with:
-          oidc_client_identifier: ${{ secrets.OIDC_CLIENT_IDENTIFIER }}
-          domain_base_url: ${{ vars.DOMAIN_BASE_URL }}
-          oci_tenancy: ${{ vars.OCI_TENANCY }}
-          oci_region: ap-singapore-1
+      - name: Exchange GitHub OIDC token for OCI session token (manual, transparent)
+        # Manual exchange (oidc_exchange.sh) replaces the gtrevorrow action black box:
+        # it prints the decoded JWT claims so a Trust-rule mismatch is diagnosable.
+        env:
+          OIDC_CLIENT_IDENTIFIER: ${{ secrets.OIDC_CLIENT_IDENTIFIER }}
+          DOMAIN_BASE_URL: ${{ vars.DOMAIN_BASE_URL }}
+          OCI_TENANCY: ${{ vars.OCI_TENANCY }}
+          OCI_REGION: ap-singapore-1
+          OCI_USER: ocid1.user.oc1..aaaaaaaaavidw4nyv67rdxq4qdbrc7t7nbhpthhdnrkc5gkyggcyf6uukata
+        run: bash oidc_exchange.sh
 
       - name: Verify OCI auth (fail fast if exchange did not work)
         run: |

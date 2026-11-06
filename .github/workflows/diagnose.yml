@@ -1,0 +1,34 @@
+name: Diagnose OCI auth
+
+on:
+  workflow_dispatch:
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up OCI credentials
+        env:
+          OCI_USER:        ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY:     ${{ secrets.OCI_TENANCY }}
+          OCI_REGION:      ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+          pip install oci -q
+          # 1. Does the private-key secret match the fingerprint secret?
+          FP=$(openssl pkey -in ~/.oci/oci_api_key.pem -pubout -outform DER 2>/dev/null | openssl md5 -c | awk '{print $2}')
+          if [ "$FP" = "$OCI_FINGERPRINT" ]; then echo "KEY_FINGERPRINT_MATCH=true"; else echo "KEY_FINGERPRINT_MATCH=false"; fi
+          # 2. Does the API accept these credentials?
+          python3 -c "import oci; c=oci.config.from_file(); u=oci.identity.IdentityClient(c); print('API_OK user='+u.get_user(c['user']).data.name)" 2>&1 | tail -3

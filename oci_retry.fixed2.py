@@ -1,0 +1,228 @@
+import oci
+import time
+import datetime
+
+# ╔══════════════════════════════════════════════════════╗
+# ║  Target : VM.Standard.A1.Flex (ARM)                  ║
+# ║  Spec   : 2 OCPU / 12 GB RAM / 100 GB disk (default) ║
+# ║  Arch   : ARM (Ampere)                               ║
+# ║  Tier   : Oracle Always Free                         ║
+# ║  OS     : Canonical Ubuntu 22.04                     ║
+# ╚══════════════════════════════════════════════════════╝
+
+# ─── Configuration ───────────────────────────────────────
+COMPARTMENT_ID = (
+    "ocid1.tenancy.oc1..aaaaaaaaaqq4ucttm4cp5yo6mqhcpucqfjpeosei6djfigrmqejcqbhv6mn3q"  # Replace with your tenancy OCID
+)
+SSH_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOnnfNHbkhLkUZ5svIAY74TW+slopucAqHYZ7Qo9tIAl indra-oracle-a1"  # Replace with your SSH public key (.pub file content)
+INSTANCE_NAME = "agent-box"
+ARM_OCPUS = 2
+ARM_MEMORY_IN_GBS = 12
+BOOT_VOLUME_SIZE_IN_GBS = 100
+RETRY_INTERVAL = 90  # seconds
+# ────────────────────────────────────────────────────────
+
+# ─── OCI Authentication ──────────────────────────────────
+# [Local] Create a config file at ~/.oci/config
+#   See README.md for format; key_file should point to your API private key .pem
+#
+# [GitHub Actions] No config file needed
+#   The workflow auto-creates it from GitHub Secrets — see README.md
+#
+# SECURITY TOKEN (UPST) — explicit signer, NOT config auto-detection.
+# The OCI Python SDK (2.190.0) does NOT detect security_token_file from the
+# config: without an explicit signer every client falls back to a plain
+# API-key Signer, which signs with the dummy/real user OCID + the ephemeral
+# key and never attaches the UPST -> API 401 NotAuthenticated (runs #238,
+# #288). The fix: build a SecurityTokenSigner from the UPST + session private
+# key and pass it explicitly to every client below.
+# ────────────────────────────────────────────────────────
+from oci.auth.signers import SecurityTokenSigner
+from oci.signer import load_private_key
+
+config = oci.config.from_file()
+with open(config["security_token_file"]) as _f:
+    _UPST = _f.read().strip()
+with open(config["key_file"]) as _f:
+    # SecurityTokenSigner needs a LOADED key object (with .public_key()),
+    # not a PEM string — passing the raw string raises AttributeError
+    # 'str' object has no attribute 'public_key' (run #289).
+    _PRIVATE_KEY = load_private_key(_f.read(), None)
+signer = SecurityTokenSigner(_UPST, _PRIVATE_KEY)
+
+
+def get_availability_domain():
+    identity = oci.identity.IdentityClient(config, signer=signer)
+    ads = identity.list_availability_domains(COMPARTMENT_ID).data
+    return ads[0].name
+
+
+def get_ubuntu_arm_image():
+    compute = oci.core.ComputeClient(config, signer=signer)
+    for version in ("24.04", "22.04"):
+        images = compute.list_images(
+            COMPARTMENT_ID,
+            operating_system="Canonical Ubuntu",
+            operating_system_version=version,
+            shape="VM.Standard.A1.Flex",
+            sort_by="TIMECREATED",
+            sort_order="DESC",
+        ).data
+        if images:
+            print(f"Using Ubuntu {version} ARM image: {images[0].display_name}")
+            return images[0].id
+    raise Exception("No Ubuntu 22.04/24.04 ARM image found")
+
+
+def create_vcn_and_subnet():
+    network = oci.core.VirtualNetworkClient(config, signer=signer)
+
+    # Check if VCN already exists
+    vcns = network.list_vcns(COMPARTMENT_ID, display_name="retry-vcn").data
+    if vcns:
+        vcn = vcns[0]
+        print(f"Using existing VCN: {vcn.id}")
+    else:
+        vcn = network.create_vcn(
+            oci.core.models.CreateVcnDetails(
+                compartment_id=COMPARTMENT_ID,
+                display_name="retry-vcn",
+                cidr_block="10.0.0.0/16",
+            )
+        ).data
+        print(f"Created VCN: {vcn.id}")
+
+        # Create Internet Gateway
+        ig = network.create_internet_gateway(
+            oci.core.models.CreateInternetGatewayDetails(
+                compartment_id=COMPARTMENT_ID,
+                vcn_id=vcn.id,
+                display_name="retry-ig",
+                is_enabled=True,
+            )
+        ).data
+
+        # Update route table to allow outbound traffic
+        network.update_route_table(
+            vcn.default_route_table_id,
+            oci.core.models.UpdateRouteTableDetails(
+                route_rules=[
+                    oci.core.models.RouteRule(
+                        destination="0.0.0.0/0",
+                        network_entity_id=ig.id,
+                    )
+                ]
+            ),
+        )
+
+        # Open inbound ports: SSH / HTTP / HTTPS / Streamlit
+        security_lists = network.list_security_lists(COMPARTMENT_ID, vcn_id=vcn.id).data
+        if security_lists:
+            existing_egress = security_lists[0].egress_security_rules
+            new_ingress = []
+            for port in [22, 80, 443, 8501]:
+                new_ingress.append(
+                    oci.core.models.IngressSecurityRule(
+                        protocol="6",
+                        source="0.0.0.0/0",
+                        tcp_options=oci.core.models.TcpOptions(
+                            destination_port_range=oci.core.models.PortRange(
+                                min=port, max=port
+                            )
+                        ),
+                    )
+                )
+            network.update_security_list(
+                security_lists[0].id,
+                oci.core.models.UpdateSecurityListDetails(
+                    ingress_security_rules=new_ingress,
+                    egress_security_rules=existing_egress,
+                ),
+            )
+
+    # Check if subnet already exists
+    subnets = network.list_subnets(
+        COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-subnet"
+    ).data
+    if subnets:
+        subnet = subnets[0]
+        print(f"Using existing subnet: {subnet.id}")
+    else:
+        subnet = network.create_subnet(
+            oci.core.models.CreateSubnetDetails(
+                compartment_id=COMPARTMENT_ID,
+                vcn_id=vcn.id,
+                display_name="retry-subnet",
+                cidr_block="10.0.0.0/24",
+                prohibit_public_ip_on_vnic=False,
+            )
+        ).data
+        print(f"Created subnet: {subnet.id}")
+
+    return subnet.id
+
+
+def try_create_instance(subnet_id, ad_name, image_id):
+    compute = oci.core.ComputeClient(config, signer=signer)
+    instance = compute.launch_instance(
+        oci.core.models.LaunchInstanceDetails(
+            compartment_id=COMPARTMENT_ID,
+            display_name=INSTANCE_NAME,
+            availability_domain=ad_name,
+            shape="VM.Standard.A1.Flex",
+            shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(
+                ocpus=ARM_OCPUS,
+                memory_in_gbs=ARM_MEMORY_IN_GBS,
+            ),
+            source_details=oci.core.models.InstanceSourceViaImageDetails(
+                image_id=image_id,
+                boot_volume_size_in_gbs=BOOT_VOLUME_SIZE_IN_GBS,
+            ),
+            create_vnic_details=oci.core.models.CreateVnicDetails(
+                subnet_id=subnet_id,
+                assign_public_ip=True,
+            ),
+            metadata={"ssh_authorized_keys": SSH_PUBLIC_KEY},
+        )
+    ).data
+    return instance
+
+
+def main():
+    print("Initializing network configuration...")
+    subnet_id = create_vcn_and_subnet()
+
+    print("Fetching availability domain...")
+    ad_name = get_availability_domain()
+    print(f"AD: {ad_name}")
+
+    print("Fetching Ubuntu ARM image (24.04, fallback 22.04)...")
+    image_id = get_ubuntu_arm_image()
+    print(f"Image ID: {image_id}")
+
+    attempt = 0
+    while True:
+        attempt += 1
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"\n[{now}] Attempt #{attempt} to create instance...")
+
+        try:
+            instance = try_create_instance(subnet_id, ad_name, image_id)
+            print(f"\n✅ Success! Instance created")
+            print(f"   ID: {instance.id}")
+            print(f"   State: {instance.lifecycle_state}")
+            print(f"   Check Oracle Cloud Console for the public IP")
+            break
+        except oci.exceptions.ServiceError as e:
+            if "Out of host capacity" in str(e) or "capacity" in str(e).lower():
+                print(f"❌ Out of capacity, retrying...")
+            else:
+                print(f"❌ API error: {e.message}, retrying...")
+        except Exception as e:
+            print(f"⚠️ Network timeout or other error, retrying... ({type(e).__name__})")
+
+        time.sleep(RETRY_INTERVAL)
+
+
+if __name__ == "__main__":
+    main()

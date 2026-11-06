@@ -1,0 +1,104 @@
+name: OCI ARM Retry
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+concurrency:
+  group: oci-retry            # Only one Job allowed per group
+  cancel-in-progress: false   # Do not cancel running jobs; new ones queue (max 1 running + 1 waiting)
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50       # UPST (OIDC session token) lasts ~60 min; keep the run well inside it
+    permissions:
+      id-token: write         # Required for GitHub OIDC JWT
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI SDK
+        run: pip install oci
+
+      - name: Exchange GitHub OIDC token for OCI session token (manual, transparent)
+        # Manual exchange (oidc_exchange.sh) replaces the gtrevorrow action black box:
+        # it prints the decoded JWT claims so a Trust-rule mismatch is diagnosable.
+        env:
+          OIDC_CLIENT_IDENTIFIER: ${{ secrets.OIDC_CLIENT_IDENTIFIER }}
+          DOMAIN_BASE_URL: ${{ vars.DOMAIN_BASE_URL }}
+          OCI_TENANCY: ${{ vars.OCI_TENANCY }}
+          OCI_REGION: ap-singapore-1
+          OCI_USER: ocid1.user.oc1..aaaaaaaaavidw4nyv67rdxq4qdbrc7t7nbhpthhdnrkc5gkyggcyf6uukata
+        run: bash oidc_exchange.sh
+
+      - name: Verify OCI auth (fail fast if exchange did not work)
+        env:
+          OCI_USER: ocid1.user.oc1..aaaaaaaaavidw4nyv67rdxq4qdbrc7t7nbhpthhdnrkc5gkyggcyf6uukata
+        run: |
+          python3 <<'PYEOF'
+          import oci, os
+          from oci.auth.signers import SecurityTokenSigner
+          from oci.signer import load_private_key
+          c = oci.config.from_file()
+          # Explicit SecurityTokenSigner: the SDK does NOT detect
+          # security_token_file from the config (2.190.0) — without this, the
+          # client falls back to a plain API-key Signer and the UPST is never
+          # attached -> 401 NotAuthenticated (runs #238, #288).
+          # NOTE: SecurityTokenSigner needs a LOADED key object, not a PEM
+          # string — raw string raises AttributeError 'str' has no
+          # attribute 'public_key' (run #289).
+          token = open(c['security_token_file']).read().strip()
+          key = load_private_key(open(c['key_file']).read(), None)
+          signer = SecurityTokenSigner(token, key)
+          u = oci.identity.IdentityClient(c, signer=signer)
+          print('API_OK user=' + u.get_user(os.environ['OCI_USER']).data.name)
+          PYEOF
+          # NOTE: config user is a dummy OCID (the UPST identifies the user),
+          # so get_user must use the OCI_USER env var, not c['user']. No pipe to tail:
+          # a pipe would mask the failure (exit code becomes 0).
+
+      - name: Run OCI retry script
+        # timeout 2700s = 45 min; UPST lasts ~60 min, so the token stays valid for the whole run
+        # Exit codes: 0 = instance created (auto-disable) | 124 = 45-min timeout, still
+        # out of capacity (relay to next Job) | anything else = fast failure, e.g. auth
+        # error (do NOT relay — a tight loop of failing runs helps nobody; fix and re-run).
+        # The step always exits 0 so the job outcome stays readable; SCRIPT_EXIT carries
+        # the real result to the two steps below.
+        id: run_script
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: |
+          set +e
+          timeout 2700 python oci_retry.py
+          echo "SCRIPT_EXIT=$?" >> "$GITHUB_ENV"
+          exit 0
+
+      - name: Auto-disable workflow on success
+        if: env.SCRIPT_EXIT == '0'
+        run: |
+          curl -s -X PUT \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable
+          echo "Workflow auto-disabled"
+
+      - name: Trigger next Job (seamless relay)
+        # Relay ONLY on a 45-min timeout (exit 124). Any other non-zero exit is a fast
+        # failure (auth/config) — relaying would spin a tight loop of failing runs.
+        if: env.SCRIPT_EXIT == '124'
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Next Job triggered"

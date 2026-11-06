@@ -29,11 +29,15 @@ LEGACY_TYPED_TENANCY = "ocid1.tenancy.oc1..aaaaaaaaaqq4ucttm4cp5yo6mqhcpucqfjpeo
 COMPARTMENT_ID = None  # set by resolve_tenancy() at the start of main()
 SSH_PUBLIC_KEY = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOnnfNHbkhLkUZ5svIAY74TW+slopucAqHYZ7Qo9tIAl indra-oracle-a1"  # Replace with your SSH public key (.pub file content)
 INSTANCE_NAME = "agent-box"
-# Shape ladder (Claude verdict 2026-11-06): try 2/12 first, then 1/6 if out of
-# capacity. "Out of host capacity" means no host has room for that shape, and
-# 1/6 fits on more hosts than 2/12. After the instance exists, resize to 2/12.
+# Shape ladder (Claude verdict 2026-11-06): alternate 2/12 and 1/6 across cycles.
+# "Out of host capacity" means no host has room for that shape, and 1/6 fits on more
+# hosts than 2/12. After the instance exists, resize to 2/12.
+# ONE LaunchInstance call per cycle, RETRY_INTERVAL apart. Never try both rungs back to
+# back: that drew a 429 on the 2nd call EVERY cycle (run #308: 7 attempts per 45 min
+# instead of ~30, because each 429 costs BACKOFF_429, and the 1/6 rung never got evaluated).
 SHAPE_LADDER = [(2, 12), (1, 6)]
-# Fault domains (Singapore has 1 AD but 3 fault domains). Rotate per attempt.
+# Fault domains (Singapore has 1 AD but 3 fault domains). Rotate per launch call; with
+# 2 shapes x 3 fault domains every (shape, fault domain) pair is hit once per 6 calls (~9 min).
 FAULT_DOMAINS = ["FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3"]
 BOOT_VOLUME_SIZE_IN_GBS = 100
 RETRY_INTERVAL = 90  # seconds
@@ -104,19 +108,19 @@ def resolve_tenancy():
 
 
 def existing_a1_instance(quiet=False):
-    """Return a live 'agent-box' A1 instance if one already exists (guard against double-create).
+    """Return a live A1 instance if one already exists (guard against a second A1).
 
-    Checks by display name (not just shape): with two retry paths running
-    (GitHub relay + CLI), the guard must catch an instance created by either
-    path, whatever shape it was launched with.
+    Matches on SHAPE only, deliberately NOT on display_name: the Always Free A1
+    allowance is one 2 OCPU / 12 GB instance in total, so an A1 made by anyone (this
+    script, the VM CLI loop, the Console) under any name must stop the retry loop.
+    (VM.Standard.A1.Flex is the shape name; 1/6 and 2/12 are both that shape.)
     """
     try:
         compute = oci.core.ComputeClient(config, signer=signer)
         live = [
             i
             for i in compute.list_instances(COMPARTMENT_ID).data
-            if i.display_name == INSTANCE_NAME
-            and i.shape == "VM.Standard.A1.Flex"
+            if i.shape == "VM.Standard.A1.Flex"
             and i.lifecycle_state not in ("TERMINATING", "TERMINATED")
         ]
         if live:
@@ -127,36 +131,46 @@ def existing_a1_instance(quiet=False):
     return None
 
 
-def get_public_ip(instance_id, wait_s=60):
+def get_public_ip(instance_id, wait_s=150, poll_s=5):
     """Return the instance's public IP, or None. Cosmetic only: never raises.
 
-    The VNIC attachment can lag a few seconds behind a fresh launch, so
-    poll briefly, then give up quietly and let the caller fall back to
-    "check the Console". get_vnic lives on VirtualNetworkClient, not
-    ComputeClient (verified against oci SDK 2.190.0).
+    Right after a launch the primary VNIC attachment is still ATTACHING, and per the SDK
+    docs its vnic_id is only set once the attachment completes (get_vnic(None) raises
+    ValueError). The VNIC itself can also 404 for a moment or have no public_ip yet. So
+    every poll has its OWN try/except: one hiccup costs one poll, not the whole lookup.
+    get_vnic lives on VirtualNetworkClient, not ComputeClient (oci SDK 2.190.0).
     """
     try:
         compute = oci.core.ComputeClient(config, signer=signer)
         vcn = oci.core.VirtualNetworkClient(config, signer=signer)
-        deadline = time.time() + wait_s
-        while True:
-            attachments = compute.list_vnic_attachments(
-                COMPARTMENT_ID, instance_id=instance_id
-            ).data
-            live = [
-                a
-                for a in attachments
-                if a.lifecycle_state not in ("TERMINATING", "TERMINATED", "DETACHING")
-            ]
-            for a in live:
-                vnic = vcn.get_vnic(a.vnic_id).data
-                if vnic.public_ip:
-                    return vnic.public_ip
-            if time.time() >= deadline:
-                return None
-            time.sleep(5)
     except Exception:
         return None
+    deadline = time.time() + wait_s
+    while True:
+        try:
+            attachments = compute.list_vnic_attachments(COMPARTMENT_ID, instance_id=instance_id).data
+            for a in attachments:
+                if a.lifecycle_state in ("DETACHING", "DETACHED") or not a.vnic_id:
+                    continue
+                ip = vcn.get_vnic(a.vnic_id).data.public_ip
+                if ip:
+                    return ip
+        except Exception:
+            pass  # not there yet / transient error: keep polling until the deadline
+        if time.time() >= deadline:
+            return None
+        time.sleep(poll_s)
+
+
+def print_public_ip(instance_id):
+    """Print the public IP + SSH command (or a Console hint). Never raises."""
+    ip = get_public_ip(instance_id)
+    if ip:
+        print(f"   Public IP: {ip}")
+        print(f"   SSH: ssh ubuntu@{ip}")
+    else:
+        print("   Public IP not available yet: check the Oracle Cloud Console.")
+
 
 def get_availability_domain():
     identity = oci.identity.IdentityClient(config, signer=signer)
@@ -303,9 +317,7 @@ def main():
     found = existing_a1_instance()
     if found:
         print(f"✅ A1 instance already exists: {found.display_name} ({found.id}, {found.lifecycle_state}) — nothing to create.")
-        public_ip = get_public_ip(found.id)
-        if public_ip:
-            print(f"   Public IP: {public_ip}")
+        print_public_ip(found.id)
         return
 
     print("Initializing network configuration...")
@@ -320,7 +332,8 @@ def main():
     print(f"Image ID: {image_id}")
 
     attempt = 0
-    launch_no = 0  # counts individual launch tries (drives fault-domain rotation)
+    launch_no = 0  # counts launch calls (drives the shape + fault-domain rotation)
+    created = None
     while True:
         attempt += 1
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -331,77 +344,65 @@ def main():
         found = existing_a1_instance(quiet=True)
         if found:
             print(f"✅ A1 instance already exists: {found.display_name} ({found.id}, {found.lifecycle_state}) — nothing to create.")
-            public_ip = get_public_ip(found.id)
-            if public_ip:
-                print(f"   Public IP: {public_ip}")
+            created = found
             break
 
-        # Shape ladder: try 2/12, then 1/6 if out of capacity (same cycle).
-        created = None
-        for (ocpus, mem) in SHAPE_LADDER:
-            fd = FAULT_DOMAINS[launch_no % len(FAULT_DOMAINS)]
-            launch_no += 1
-            print(f"  Trying {ocpus} OCPU / {mem} GB on {fd}...")
-            try:
-                created = try_create_instance(subnet_id, ad_name, image_id, ocpus, mem, fd)
-                print(f"\n✅ Success! Instance created ({ocpus} OCPU / {mem} GB, {fd})")
-                print(f"   ID: {created.id}")
-                print(f"   State: {created.lifecycle_state}")
-                public_ip = get_public_ip(created.id)
-                if public_ip:
-                    print(f"   Public IP: {public_ip}")
-                    print(f"   SSH: ssh ubuntu@{public_ip}")
-                else:
-                    print(f"   Check Oracle Cloud Console for the public IP")
-                break
-            except oci.exceptions.ServiceError as e:
-                detail = f"{e.status} {e.code}: {e.message}"
-                if e.status == 429:
-                    print(f"⏳ Rate limited ({detail}); backing off {BACKOFF_429}s")
-                    time.sleep(BACKOFF_429)
-                    continue
-                if "capacity" in str(e).lower():
-                    print(f"❌ Out of capacity ({ocpus}/{mem}, {fd}), trying next shape...")
-                    continue
-                elif e.status >= 500:
-                    print(f"❌ Oracle server error ({detail}), retrying...")
-                elif e.status in (400, 401, 403, 404) or e.code in (
-                    "LimitExceeded",
-                    "QuotaExceeded",
-                    "NotAuthorizedOrResourceAlreadyExists",  # CREATE calls answer 409 here instead of 404
-                ):
-                    if e.code == "NotAuthorizedOrResourceAlreadyExists":
-                        # A 409 here can mean the instance was created between
-                        # the guard check and the launch: verify before dying.
-                        found = existing_a1_instance(quiet=True)
-                        if found:
-                            print(f"✅ Instance already exists (409): {found.id} ({found.lifecycle_state})")
-                            public_ip = get_public_ip(found.id)
-                            if public_ip:
-                                print(f"   Public IP: {public_ip}")
-                            created = found
-                            break
-                    # Config / auth / permission / quota problem: retrying cannot fix it.
-                    # Exit code 2 (not 124) tells the workflow NOT to relay a new job.
-                    print(f"🛑 FATAL, not a capacity problem: {detail}")
-                    sys.exit(2)
-                else:
-                    print(f"❌ API error: {detail}, retrying...")
-            except Exception as e:
-                print(f"⚠️ Network timeout or other error, retrying... ({type(e).__name__})")
-                # Outcome unknown: the request may have reached Oracle. Never double-create.
-                found = existing_a1_instance(quiet=True)
-                if found:
-                    print(f"✅ Instance exists after all: {found.id} ({found.lifecycle_state})")
-                    public_ip = get_public_ip(found.id)
-                    if public_ip:
-                        print(f"   Public IP: {public_ip}")
-                    created = found
-                    break
-        if created:
+        # ONE launch call per cycle: the shape alternates 2/12 <-> 1/6 and the fault domain
+        # rotates (see SHAPE_LADDER). Two calls back to back = a 429 on the 2nd, every time.
+        ocpus, mem = SHAPE_LADDER[launch_no % len(SHAPE_LADDER)]
+        fd = FAULT_DOMAINS[launch_no % len(FAULT_DOMAINS)]
+        launch_no += 1
+        print(f"  Trying {ocpus} OCPU / {mem} GB on {fd}...")
+        try:
+            created = try_create_instance(subnet_id, ad_name, image_id, ocpus, mem, fd)
+            print(f"\n✅ Success! Instance created ({ocpus} OCPU / {mem} GB, {fd})")
+            print(f"   ID: {created.id}")
+            print(f"   State: {created.lifecycle_state}")
             break
+        except oci.exceptions.ServiceError as e:
+            detail = f"{e.status} {e.code}: {e.message}"
+            if e.status == 429:
+                print(f"⏳ Rate limited ({detail}); backing off {BACKOFF_429}s")
+                time.sleep(BACKOFF_429)
+                continue
+            if "capacity" in str(e).lower():
+                print(f"❌ Out of capacity ({ocpus}/{mem}, {fd}), retrying...")
+            elif e.status >= 500:
+                print(f"❌ Oracle server error ({detail}), retrying...")
+            elif e.status in (400, 401, 403, 404) or e.code in (
+                "LimitExceeded",
+                "QuotaExceeded",
+                "NotAuthorizedOrResourceAlreadyExists",  # CREATE calls answer 409 here instead of 404
+            ):
+                if e.code == "NotAuthorizedOrResourceAlreadyExists":
+                    # A 409 here can mean the instance was created between
+                    # the guard check and the launch: verify before dying.
+                    found = existing_a1_instance(quiet=True)
+                    if found:
+                        print(f"✅ Instance already exists (409): {found.id} ({found.lifecycle_state})")
+                        created = found
+                        break
+                # Config / auth / permission / quota problem: retrying cannot fix it.
+                # Exit code 2 (not 124) tells the workflow NOT to relay a new job.
+                print(f"🛑 FATAL, not a capacity problem: {detail}")
+                sys.exit(2)
+            else:
+                print(f"❌ API error: {detail}, retrying...")
+        except Exception as e:
+            print(f"⚠️ Network timeout or other error, retrying... ({type(e).__name__})")
+            # Outcome unknown: the request may have reached Oracle. Never double-create.
+            found = existing_a1_instance(quiet=True)
+            if found:
+                print(f"✅ Instance exists after all: {found.id} ({found.lifecycle_state})")
+                created = found
+                break
 
         time.sleep(RETRY_INTERVAL)
+
+    # Every way out of the loop sets `created` (a new instance, or one that already existed).
+    # Reported AFTER the loop, outside any launch try/except: print_public_ip() never raises,
+    # so nothing in it can turn a success into an error or into a second launch.
+    print_public_ip(created.id)
 
 
 if __name__ == "__main__":

@@ -10,7 +10,10 @@ concurrency:
 jobs:
   retry:
     runs-on: ubuntu-latest
-    timeout-minutes: 355      # Close to GitHub Actions 6-hour limit
+    timeout-minutes: 50       # UPST (OIDC session token) lasts ~60 min; keep the run well inside it
+    permissions:
+      id-token: write         # Required for GitHub OIDC JWT
+      contents: read
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
 
@@ -26,39 +29,32 @@ jobs:
       - name: Install OCI SDK
         run: pip install oci
 
-      - name: Set up OCI credentials
-        env:
-          OCI_USER:        ${{ secrets.OCI_USER }}
-          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
-          OCI_TENANCY:     ${{ secrets.OCI_TENANCY }}
-          OCI_REGION:      ${{ secrets.OCI_REGION }}
-          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      - name: Set up Node (for OIDC exchange action)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Exchange GitHub OIDC token for OCI session token
+        uses: gtrevorrow/oci-token-exchange-action@v1
+        with:
+          oidc_client_identifier: ${{ secrets.OIDC_CLIENT_IDENTIFIER }}
+          domain_base_url: ${{ vars.DOMAIN_BASE_URL }}
+          oci_tenancy: ${{ vars.OCI_TENANCY }}
+          oci_region: ap-singapore-1
+
+      - name: Verify OCI auth (fail fast if exchange did not work)
         run: |
-          mkdir -p ~/.oci
-
-          # Write API private key
-          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
-          chmod 600 ~/.oci/oci_api_key.pem
-
-          # Write config (key_file uses absolute path)
-          cat > ~/.oci/config << EOF
-          [DEFAULT]
-          user=$OCI_USER
-          fingerprint=$OCI_FINGERPRINT
-          tenancy=$OCI_TENANCY
-          region=$OCI_REGION
-          key_file=/home/runner/.oci/oci_api_key.pem
-          EOF
+          python3 -c "import oci; c=oci.config.from_file(); u=oci.identity.IdentityClient(c); print('API_OK user='+u.get_user(c['user']).data.name)" 2>&1 | tail -3
 
       - name: Run OCI retry script
         # Script succeeds (exit 0)  → next step auto-disables the workflow
         # Timeout expires (exit 124) → treated as failure, triggers next Job
-        # timeout 19800s = 330 min, 25 min less than job timeout 355 min (buffer for setup steps)
+        # timeout 2700s = 45 min; UPST lasts ~60 min, so the token stays valid for the whole run
         id: run_script
         continue-on-error: true
         env:
           PYTHONUNBUFFERED: "1"
-        run: timeout 19800 python oci_retry.py
+        run: timeout 2700 python oci_retry.py
 
       - name: Auto-disable workflow on success
         if: steps.run_script.outcome == 'success'

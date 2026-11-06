@@ -37,5 +37,8 @@ jobs:
           # 1. Does the private-key secret match the fingerprint secret?
           FP=$(openssl pkey -in ~/.oci/oci_api_key.pem -pubout -outform DER 2>/dev/null | openssl md5 -c | awk '{print $2}')
           if [ "$FP" = "$OCI_FINGERPRINT" ]; then echo "KEY_FINGERPRINT_MATCH=true"; else echo "KEY_FINGERPRINT_MATCH=false"; fi
-          # 2. Does the API accept these credentials?
+          # 2. Does the API accept these credentials? (Python SDK)
           python3 -c "import oci; c=oci.config.from_file(); u=oci.identity.IdentityClient(c); print('API_OK user='+u.get_user(c['user']).data.name)" 2>&1 | tail -3
+          # 3. Same call via the OCI CLI (Cloud Shell used the CLI and worked)
+          pip install oci-cli -q
+          oci iam user get --user-id "$OCI_USER" --query 'data.name' --output text 2>&1 | tail -3

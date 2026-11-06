@@ -10,9 +10,15 @@
 #     requested_token_type urn:oci:token-type:oci-upst, subject_token_type "jwt",
 #     Basic auth client_id:client_secret
 #   - response JSON field "token" = UPST
-#   - OCI config: user literally "not used" (the UPST identifies the user),
-#     NO auth= line (SDK detects security_token_file) + security_token_file + key_file.
-#     A real user OCID in user= makes the API reject the UPST with 401.
+#   - OCI config: user = a DUMMY OCID (valid format, not a real user) + NO auth=
+#     line (SDK detects security_token_file) + security_token_file + key_file.
+#     The UPST identifies the real user; the config user value is ignored by the
+#     API. A real user OCID in user= makes the API reject the UPST with 401.
+#     NOTE (2026-11-06 run #287): "user=not used" (as in the gtrevorrow action)
+#     FAILS the current OCI SDK's config validation — its regex requires an
+#     OCID-shaped value, so "not used" raises InvalidConfig {'user': 'malformed'}
+#     before any API call. The dummy OCID passes validation and is ignored the
+#     same way "not used" is.
 #
 # Env vars (set by the workflow from secrets/vars):
 #   OIDC_CLIENT_IDENTIFIER = client_id:client_secret (Confidential App runtime)
@@ -98,7 +104,7 @@ printf '%s' "$UPST" > "$SESS_DIR/token"
 chmod 600 "$SESS_DIR/token"
 cat > "$OCI_DIR/config" <<EOF
 [DEFAULT]
-user=not used
+user=ocid1.user.oc1..aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 fingerprint=$FINGERPRINT
 tenancy=$TENANCY
 region=$REGION

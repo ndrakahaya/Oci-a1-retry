@@ -1,0 +1,80 @@
+name: OCI ARM Retry
+
+on:
+  workflow_dispatch:  # Manual trigger only
+
+concurrency:
+  group: oci-retry            # Only one Job allowed per group
+  cancel-in-progress: false   # Do not cancel running jobs; new ones queue (max 1 running + 1 waiting)
+
+jobs:
+  retry:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355      # Close to GitHub Actions 6-hour limit
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI SDK
+        run: pip install oci
+
+      - name: Set up OCI credentials
+        env:
+          OCI_USER:        ${{ secrets.OCI_USER }}
+          OCI_FINGERPRINT: ${{ secrets.OCI_FINGERPRINT }}
+          OCI_TENANCY:     ${{ secrets.OCI_TENANCY }}
+          OCI_REGION:      ${{ secrets.OCI_REGION }}
+          OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+        run: |
+          mkdir -p ~/.oci
+
+          # Write API private key
+          printf '%s' "$OCI_PRIVATE_KEY" > ~/.oci/oci_api_key.pem
+          chmod 600 ~/.oci/oci_api_key.pem
+
+          # Write config (key_file uses absolute path)
+          cat > ~/.oci/config << EOF
+          [DEFAULT]
+          user=$OCI_USER
+          fingerprint=$OCI_FINGERPRINT
+          tenancy=$OCI_TENANCY
+          region=$OCI_REGION
+          key_file=/home/runner/.oci/oci_api_key.pem
+          EOF
+
+      - name: Run OCI retry script
+        # Script succeeds (exit 0)  → next step auto-disables the workflow
+        # Timeout expires (exit 124) → treated as failure, triggers next Job
+        # timeout 19800s = 330 min, 25 min less than job timeout 355 min (buffer for setup steps)
+        id: run_script
+        continue-on-error: true
+        env:
+          PYTHONUNBUFFERED: "1"
+        run: timeout 19800 python oci_retry.py
+
+      - name: Auto-disable workflow on success
+        if: steps.run_script.outcome == 'success'
+        run: |
+          curl -s -X PUT \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable
+          echo "Workflow auto-disabled"
+
+      - name: Trigger next Job (seamless relay)
+        if: steps.run_script.outcome != 'success'
+        run: |
+          curl -s -X POST \
+            -H "Authorization: token ${{ secrets.GH_PAT }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "Next Job triggered"

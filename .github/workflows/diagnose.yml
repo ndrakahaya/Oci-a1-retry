@@ -41,4 +41,4 @@ jobs:
           python3 -c "import oci; c=oci.config.from_file(); u=oci.identity.IdentityClient(c); print('API_OK user='+u.get_user(c['user']).data.name)" 2>&1 | tail -3
           # 3. Same call via the OCI CLI (Cloud Shell used the CLI and worked)
           pip install oci-cli -q
-          oci iam user get --user-id "$OCI_USER" --query 'data.name' --output text 2>&1 | tail -3
+          oci iam user get --user-id "$OCI_USER" --query 'data.name' --output json 2>&1 | tail -3

@@ -1,0 +1,82 @@
+name: OCI retry watchdog
+
+# Safety net for the relay chain in oci_retry.yml. If the chain dies silently
+# (relay dispatch failed, runner died, GitHub hiccup), nothing restarts it —
+# this workflow notices and restarts it. It NEVER restarts after a FAILED run:
+# a fatal auth/config error would just loop. For failures it only notifies.
+#
+# How it decides (conservative, to avoid false restarts):
+# - workflow disabled (instance created, auto-disable) -> do nothing.
+# - a run is queued/in_progress -> chain alive, do nothing.
+# - latest run failed/cancelled -> notify only, do NOT restart.
+# - latest run succeeded < 2h ago -> chain alive, do nothing.
+# - latest run succeeded >= 2h ago, no run active -> chain dead, dispatch + notify.
+
+on:
+  schedule:
+    - cron: '0 * * * *'  # every hour
+  workflow_dispatch:  # manual, for testing
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Check relay chain and restart if dead
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          AUTH="Authorization: token $GH_PAT"
+          API="https://api.github.com/repos/$REPO/actions/workflows/oci_retry.yml"
+          NTFY="https://ntfy.sh/oci-a1-retry-ndrakahaya-2c085768"
+
+          # 1. Workflow disabled = instance was created (auto-disable). Done.
+          STATE=$(curl -sS -f --max-time 30 -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API" \
+            | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
+          if [ "$STATE" != "active" ]; then
+            echo "Workflow is $STATE (instance created, auto-disabled). Watchdog does nothing."
+            exit 0
+          fi
+
+          # 2. Latest run of oci_retry.yml.
+          RUN_JSON=$(curl -sS -f --max-time 30 -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API/runs?per_page=1")
+          STATUS=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['status'])")
+          CONCLUSION=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['conclusion'] or '')")
+          UPDATED=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['updated_at'])")
+          RUN_ID=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
+          echo "Latest run #$RUN_ID: status=$STATUS conclusion=$CONCLUSION updated_at=$UPDATED"
+
+          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
+            echo "A run is active. Chain is alive. Nothing to do."
+            exit 0
+          fi
+
+          # Completed but failed/cancelled: do NOT auto-restart (could be a
+          # fatal auth/config error; restarting would loop). Notify only.
+          if [ "$CONCLUSION" != "success" ]; then
+            echo "Latest run ended $CONCLUSION. Not restarting. Notifying only."
+            curl -sS -f --max-time 30 -d "OCI retry watchdog: latest run #$RUN_ID ended $CONCLUSION - chain dead, needs human check" "$NTFY" || true
+            exit 0
+          fi
+
+          # Completed successfully: how long ago?
+          AGE_MIN=$(python3 -c "from datetime import datetime, timezone; u=datetime.fromisoformat('$UPDATED'.replace('Z','+00:00')); print(int((datetime.now(timezone.utc)-u).total_seconds()//60))")
+          echo "Latest successful run finished $AGE_MIN min ago."
+          if [ "$AGE_MIN" -lt 120 ]; then
+            echo "Chain is alive (relay in progress or just finished). Nothing to do."
+            exit 0
+          fi
+
+          echo "Chain is DEAD: last successful run finished $AGE_MIN min ago, no run active. Dispatching a new run."
+          curl -sS -f --max-time 30 -X POST -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API/dispatches" -d '{"ref":"main"}'
+          curl -sS -f --max-time 30 -d "OCI retry watchdog: chain was dead ($AGE_MIN min), restarted run" "$NTFY" || true
+          echo "Watchdog restarted the chain."

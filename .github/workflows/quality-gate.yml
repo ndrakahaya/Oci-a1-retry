@@ -9,19 +9,23 @@ on:
     branches: [main]
     paths:
       - 'oci_retry.py'
+      - 'oidc_exchange.sh'
       - 'check_invariants.py'
       - 'test_retry_simulation.py'
       - 'CONSTRAINTS.md'
       - '.github/workflows/quality-gate.yml'
       - '.github/workflows/oci_retry.yml'
+      - '.github/workflows/watchdog.yml'
   pull_request:
     paths:
       - 'oci_retry.py'
+      - 'oidc_exchange.sh'
       - 'check_invariants.py'
       - 'test_retry_simulation.py'
       - 'CONSTRAINTS.md'
       - '.github/workflows/quality-gate.yml'
       - '.github/workflows/oci_retry.yml'
+      - '.github/workflows/watchdog.yml'
 
 jobs:
   gate:

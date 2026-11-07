@@ -27,7 +27,14 @@ jobs:
           python-version: '3.11'
 
       - name: Install OCI SDK
-        run: pip install oci
+        # Pinned to 2.190.0 (the version diagnose.yml proved works): an
+        # unpinned install could pull a breaking SDK release and kill every
+        # run at once. Retry 3x with a pause: a transient pip failure must
+        # not kill the relay chain. The import check after the loop fails the
+        # step visibly if pip never succeeded.
+        run: |
+          for i in 1 2 3; do pip install oci==2.190.0 -q && break || sleep 15; done
+          python3 -c "import oci; print('OCI_SDK_VERSION=' + oci.__version__)"
 
       - name: Exchange GitHub OIDC token for OCI session token (manual, transparent)
         # Manual exchange (oidc_exchange.sh) replaces the gtrevorrow action black box:
@@ -104,7 +111,7 @@ jobs:
       - name: Auto-disable workflow on success
         if: env.SCRIPT_EXIT == '0'
         run: |
-          curl -s -X PUT \
+          curl -sS -f --max-time 30 -X PUT \
             -H "Authorization: token ${{ secrets.GH_PAT }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable
@@ -113,11 +120,26 @@ jobs:
       - name: Trigger next Job (seamless relay)
         # Relay ONLY on a 45-min timeout (exit 124). Any other non-zero exit is a fast
         # failure (auth/config) — relaying would spin a tight loop of failing runs.
+        # -f makes curl FAIL on HTTP errors: without it, an expired GH_PAT (401)
+        # exits 0, the step "succeeds", and the relay chain dies silently.
         if: env.SCRIPT_EXIT == '124'
         run: |
-          curl -s -X POST \
+          curl -sS -f --max-time 30 -X POST \
             -H "Authorization: token ${{ secrets.GH_PAT }}" \
             -H "Accept: application/vnd.github.v3+json" \
             https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches \
             -d '{"ref":"main"}'
           echo "Next Job triggered"
+
+      - name: Notify on fatal failure
+        # SCRIPT_EXIT is neither 0 (success) nor 124 (timeout/relay): the run
+        # died fatally (auth/config) and the relay will NOT restart it.
+        # Without this step nobody learns the chain is dead. Notify via ntfy
+        # (no secret needed): subscribe once in the ntfy app/web to
+        # ntfy.sh/oci-a1-retry-ndrakahaya-2c085768.
+        if: env.SCRIPT_EXIT != '' && env.SCRIPT_EXIT != '0' && env.SCRIPT_EXIT != '124'
+        run: |
+          curl -sS -f --max-time 30 \
+            -d "OCI retry FATAL (exit ${{ env.SCRIPT_EXIT }}) - relay stopped, check GitHub Actions" \
+            "https://ntfy.sh/oci-a1-retry-ndrakahaya-2c085768"
+          echo "Fatal-failure notification sent"

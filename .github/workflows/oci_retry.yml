@@ -14,6 +14,8 @@ jobs:
     permissions:
       id-token: write         # Required for GitHub OIDC JWT
       contents: read
+      actions: write          # Finish step: built-in-token fallback for dispatching the next job / disabling the workflow
+      issues: write           # Finish step: "instance ready" notification issue
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
 
@@ -27,14 +29,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install OCI SDK
-        # Pinned to 2.190.0 (the version diagnose.yml proved works): an
-        # unpinned install could pull a breaking SDK release and kill every
-        # run at once. Retry 3x with a pause: a transient pip failure must
-        # not kill the relay chain. The import check after the loop fails the
-        # step visibly if pip never succeeded.
-        run: |
-          for i in 1 2 3; do pip install oci==2.190.0 -q && break || sleep 15; done
-          python3 -c "import oci; print('OCI_SDK_VERSION=' + oci.__version__)"
+        run: pip install oci==2.190.0   # the version this code was verified against (diagnose.yml pins it too)
 
       - name: Exchange GitHub OIDC token for OCI session token (manual, transparent)
         # Manual exchange (oidc_exchange.sh) replaces the gtrevorrow action black box:
@@ -96,8 +91,9 @@ jobs:
         # Exit codes: 0 = instance created (auto-disable) | 124 = 45-min timeout, still
         # out of capacity (relay to next Job) | anything else = fast failure, e.g. auth
         # error (do NOT relay — a tight loop of failing runs helps nobody; fix and re-run).
-        # The step always exits 0 so the job outcome stays readable; SCRIPT_EXIT carries
-        # the real result to the two steps below.
+        # The step always exits 0 so SCRIPT_EXIT can be read; the Finish step below turns
+        # anything other than 0 / 124 into a red job (failure e-mail) and relays only on 124.
+        # 124 also covers "session token expired mid-run" (the script exits 124 itself).
         id: run_script
         env:
           PYTHONUNBUFFERED: "1"
@@ -108,38 +104,59 @@ jobs:
           echo "SCRIPT_EXIT=$?" >> "$GITHUB_ENV"
           exit 0
 
-      - name: Auto-disable workflow on success
-        if: env.SCRIPT_EXIT == '0'
+      - name: Finish (disable on success | relay on timeout | fail loudly otherwise)
+        # One step decides everything from SCRIPT_EXIT. What changed from the old three steps:
+        #  - every GitHub API call is now checked. curl -s used to swallow a 401 from an expired
+        #    GH_PAT and still print "Next Job triggered", so the chain died without a sound;
+        #  - GH_PAT is tried first, then the built-in token (job permission actions: write),
+        #    so an expired PAT alone can no longer break the relay;
+        #  - a fast failure (exit 1 / 2 / ...) now turns the job red. Before, the script step
+        #    always exited 0, the job stayed green and no failure e-mail was ever sent;
+        #  - on success an issue @-mentioning the owner is opened (best effort), because GitHub
+        #    sends no e-mail for a green run.
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          BUILTIN_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          REF: ${{ github.ref_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          curl -sS -f --max-time 30 -X PUT \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/disable
-          echo "Workflow auto-disabled"
-
-      - name: Trigger next Job (seamless relay)
-        # Relay ONLY on a 45-min timeout (exit 124). Any other non-zero exit is a fast
-        # failure (auth/config) — relaying would spin a tight loop of failing runs.
-        # -f makes curl FAIL on HTTP errors: without it, an expired GH_PAT (401)
-        # exits 0, the step "succeeds", and the relay chain dies silently.
-        if: env.SCRIPT_EXIT == '124'
-        run: |
-          curl -sS -f --max-time 30 -X POST \
-            -H "Authorization: token ${{ secrets.GH_PAT }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/oci_retry.yml/dispatches \
-            -d '{"ref":"main"}'
-          echo "Next Job triggered"
-
-      - name: Notify on fatal failure
-        # SCRIPT_EXIT is neither 0 (success) nor 124 (timeout/relay): the run
-        # died fatally (auth/config) and the relay will NOT restart it.
-        # Without this step nobody learns the chain is dead. Notify via ntfy
-        # (no secret needed): subscribe once in the ntfy app/web to
-        # ntfy.sh/oci-a1-retry-ndrakahaya-2c085768.
-        if: env.SCRIPT_EXIT != '' && env.SCRIPT_EXIT != '0' && env.SCRIPT_EXIT != '124'
-        run: |
-          curl -sS -f --max-time 30 \
-            -d "OCI retry FATAL (exit ${{ env.SCRIPT_EXIT }}) - relay stopped, check GitHub Actions" \
-            "https://ntfy.sh/oci-a1-retry-ndrakahaya-2c085768"
-          echo "Fatal-failure notification sent"
+          api() {  # api METHOD PATH [gh api args...]: PAT first, then built-in token; 3 rounds
+            local round tok
+            for round in 1 2 3; do
+              for tok in "$GH_PAT" "$BUILTIN_TOKEN"; do
+                [ -n "$tok" ] || continue
+                if GH_TOKEN="$tok" gh api --method "$1" "repos/$REPO/$2" "${@:3}" > /dev/null; then
+                  return 0
+                fi
+              done
+              sleep 10
+            done
+            return 1
+          }
+          case "${SCRIPT_EXIT:-unknown}" in
+            0)
+              GH_TOKEN="$BUILTIN_TOKEN" gh issue create --repo "$REPO" \
+                --title "A1 instance ready (run #$GITHUB_RUN_NUMBER)" \
+                --body "@${GITHUB_REPOSITORY_OWNER} the retry loop is done: the A1 instance exists. Public IP and SSH command are in the log of $RUN_URL (step: Run OCI retry script) and in the Oracle Cloud Console. If it came up as 1 OCPU / 6 GB, run the OCI A1 Resize workflow (tick confirm_reboot) to raise it to 2 OCPU / 12 GB. This workflow is being disabled now." \
+                || echo "::warning::could not open the notification issue"
+              if api PUT actions/workflows/oci_retry.yml/disable; then
+                echo "Workflow auto-disabled"
+              else
+                echo "::error::instance exists but the workflow could NOT be disabled: disable it by hand"
+                exit 1
+              fi
+              ;;
+            124)
+              if api POST actions/workflows/oci_retry.yml/dispatches -f ref="$REF"; then
+                echo "Next job triggered"
+              else
+                echo "::error::relay failed with both tokens: the chain stops here, run the workflow again by hand"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::oci_retry.py exited with ${SCRIPT_EXIT:-unknown} (2 = config / auth / permission / quota, 1 = setup kept failing): not relaying. Read the log above, fix, then run the workflow again."
+              exit 1
+              ;;
+          esac

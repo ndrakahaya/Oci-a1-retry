@@ -1,0 +1,57 @@
+name: OCI A1 Resize
+
+# Raise the A1 instance made by "OCI ARM Retry" (when the 1 OCPU / 6 GB rung won) to
+# 2 OCPU / 12 GB. A running instance is REBOOTED while its shape changes; its public IP and
+# disk stay. Without the confirm_reboot tick it only prints the current size.
+on:
+  workflow_dispatch:
+    inputs:
+      confirm_reboot:
+        description: "Centang = izinkan instance di-reboot. Tanpa centang hanya menampilkan ukuran sekarang."
+        type: boolean
+        default: false
+
+concurrency:
+  group: oci-resize
+  cancel-in-progress: false
+
+jobs:
+  resize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50       # UPST (OIDC session token) lasts ~60 min; the script stops at 43 min
+    permissions:
+      id-token: write         # Required for GitHub OIDC JWT
+      contents: read
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true  # Suppress Node.js 20 deprecation warning
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install OCI SDK
+        run: pip install oci==2.190.0   # same version as oci_retry.yml
+
+      - name: Exchange GitHub OIDC token for OCI session token
+        env:
+          OIDC_CLIENT_IDENTIFIER: ${{ secrets.OIDC_CLIENT_IDENTIFIER }}
+          DOMAIN_BASE_URL: ${{ vars.DOMAIN_BASE_URL }}
+          OCI_TENANCY: ${{ vars.OCI_TENANCY }}
+          OCI_REGION: ap-singapore-1
+          OCI_USER: ocid1.user.oc1..aaaaaaaaavidw4nyv67rdxq4qdbrc7t7nbhpthhdnrkc5gkyggcyf6uukata
+        run: bash oidc_exchange.sh
+
+      - name: Resize instance
+        # Exit codes: 0 = at the target size | 124 = no capacity for 43 min, run it again later |
+        # 2 = not confirmed / no instance / config, auth or limit problem | 1 = see the log.
+        # Any non-zero exit makes the job red, which also sends GitHub's failure e-mail.
+        env:
+          PYTHONUNBUFFERED: "1"
+          OCI_USER: ocid1.user.oc1..aaaaaaaaavidw4nyv67rdxq4qdbrc7t7nbhpthhdnrkc5gkyggcyf6uukata
+          CONFIRM_REBOOT: ${{ inputs.confirm_reboot }}
+        run: timeout 2700 python resize_instance.py

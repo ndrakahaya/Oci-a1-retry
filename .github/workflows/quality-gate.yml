@@ -9,6 +9,7 @@ on:
     branches: [main]
     paths:
       - 'oci_retry.py'
+      - 'resize_instance.py'
       - 'oidc_exchange.sh'
       - 'check_invariants.py'
       - 'test_retry_simulation.py'
@@ -16,9 +17,11 @@ on:
       - '.github/workflows/quality-gate.yml'
       - '.github/workflows/oci_retry.yml'
       - '.github/workflows/watchdog.yml'
+      - '.github/workflows/resize.yml'
   pull_request:
     paths:
       - 'oci_retry.py'
+      - 'resize_instance.py'
       - 'oidc_exchange.sh'
       - 'check_invariants.py'
       - 'test_retry_simulation.py'
@@ -26,6 +29,7 @@ on:
       - '.github/workflows/quality-gate.yml'
       - '.github/workflows/oci_retry.yml'
       - '.github/workflows/watchdog.yml'
+      - '.github/workflows/resize.yml'
 
 jobs:
   gate:

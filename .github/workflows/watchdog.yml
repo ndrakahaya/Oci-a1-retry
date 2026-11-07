@@ -1,82 +1,48 @@
-name: OCI retry watchdog
+name: OCI Retry Watchdog
 
-# Safety net for the relay chain in oci_retry.yml. If the chain dies silently
-# (relay dispatch failed, runner died, GitHub hiccup), nothing restarts it —
-# this workflow notices and restarts it. It NEVER restarts after a FAILED run:
-# a fatal auth/config error would just loop. For failures it only notifies.
-#
-# How it decides (conservative, to avoid false restarts):
-# - workflow disabled (instance created, auto-disable) -> do nothing.
-# - a run is queued/in_progress -> chain alive, do nothing.
-# - latest run failed/cancelled -> notify only, do NOT restart.
-# - latest run succeeded < 2h ago -> chain alive, do nothing.
-# - latest run succeeded >= 2h ago, no run active -> chain dead, dispatch + notify.
-
+# OPTIONAL safety net for the relay chain in oci_retry.yml.
+# Every 30 minutes: if oci_retry.yml is enabled but nothing is queued or running (the chain
+# died: expired GH_PAT, a GitHub hiccup, ...), start it again. It does nothing when
+#   - oci_retry.yml is disabled (it disables itself once the instance exists), or
+#   - a run is already queued or in progress, or
+#   - the last 3 finished runs all failed (circuit breaker: a config problem needs a human,
+#     otherwise this would re-dispatch a failing run forever).
+# To stop the whole thing on purpose, disable oci_retry.yml (or this workflow).
 on:
   schedule:
-    - cron: '0 * * * *'  # every hour
-  workflow_dispatch:  # manual, for testing
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
 
 jobs:
-  watch:
+  watchdog:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: read
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      REF: ${{ github.ref_name }}
     steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-
-      - name: Check relay chain and restart if dead
-        env:
-          GH_PAT: ${{ secrets.GH_PAT }}
+      - name: Restart the chain if it died
         run: |
-          set -euo pipefail
-          REPO="${{ github.repository }}"
-          AUTH="Authorization: token $GH_PAT"
-          API="https://api.github.com/repos/$REPO/actions/workflows/oci_retry.yml"
-          NTFY="https://ntfy.sh/oci-a1-retry-ndrakahaya-2c085768"
-
-          # 1. Workflow disabled = instance was created (auto-disable). Done.
-          STATE=$(curl -sS -f --max-time 30 -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API" \
-            | python3 -c "import sys,json; print(json.load(sys.stdin)['state'])")
-          if [ "$STATE" != "active" ]; then
-            echo "Workflow is $STATE (instance created, auto-disabled). Watchdog does nothing."
+          state=$(gh api "repos/$REPO/actions/workflows/oci_retry.yml" --jq .state)
+          if [ "$state" != "active" ]; then
+            echo "oci_retry.yml is $state: nothing to do"
             exit 0
           fi
-
-          # 2. Latest run of oci_retry.yml.
-          RUN_JSON=$(curl -sS -f --max-time 30 -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API/runs?per_page=1")
-          STATUS=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['status'])")
-          CONCLUSION=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['conclusion'] or '')")
-          UPDATED=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['updated_at'])")
-          RUN_ID=$(echo "$RUN_JSON" | python3 -c "import sys,json; print(json.load(sys.stdin)['workflow_runs'][0]['id'])")
-          echo "Latest run #$RUN_ID: status=$STATUS conclusion=$CONCLUSION updated_at=$UPDATED"
-
-          if [ "$STATUS" = "queued" ] || [ "$STATUS" = "in_progress" ]; then
-            echo "A run is active. Chain is alive. Nothing to do."
+          runs=$(gh api "repos/$REPO/actions/workflows/oci_retry.yml/runs?per_page=30")
+          live=$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<< "$runs")
+          if [ "$live" -gt 0 ]; then
+            echo "$live run(s) queued or in progress: the chain is alive"
             exit 0
           fi
-
-          # Completed but failed/cancelled: do NOT auto-restart (could be a
-          # fatal auth/config error; restarting would loop). Notify only.
-          if [ "$CONCLUSION" != "success" ]; then
-            echo "Latest run ended $CONCLUSION. Not restarting. Notifying only."
-            curl -sS -f --max-time 30 -d "OCI retry watchdog: latest run #$RUN_ID ended $CONCLUSION - chain dead, needs human check" "$NTFY" || true
+          bad=$(jq '[.workflow_runs[] | select(.status == "completed") | .conclusion] | .[0:3] | map(select(. == "failure" or . == "timed_out")) | length' <<< "$runs")
+          if [ "$bad" -ge 3 ]; then
+            echo "::warning::the last 3 runs all failed: not restarting. Fix the cause, then run oci_retry.yml by hand."
             exit 0
           fi
-
-          # Completed successfully: how long ago?
-          AGE_MIN=$(python3 -c "from datetime import datetime, timezone; u=datetime.fromisoformat('$UPDATED'.replace('Z','+00:00')); print(int((datetime.now(timezone.utc)-u).total_seconds()//60))")
-          echo "Latest successful run finished $AGE_MIN min ago."
-          if [ "$AGE_MIN" -lt 120 ]; then
-            echo "Chain is alive (relay in progress or just finished). Nothing to do."
-            exit 0
-          fi
-
-          echo "Chain is DEAD: last successful run finished $AGE_MIN min ago, no run active. Dispatching a new run."
-          curl -sS -f --max-time 30 -X POST -H "$AUTH" -H "Accept: application/vnd.github.v3+json" "$API/dispatches" -d '{"ref":"main"}'
-          curl -sS -f --max-time 30 -d "OCI retry watchdog: chain was dead ($AGE_MIN min), restarted run" "$NTFY" || true
-          echo "Watchdog restarted the chain."
+          gh api --method POST "repos/$REPO/actions/workflows/oci_retry.yml/dispatches" -f ref="$REF"
+          echo "::warning::the chain was dead: oci_retry.yml dispatched again"

@@ -185,6 +185,53 @@ def main():
     if wf.count("env.SCRIPT_EXIT == '0'") != 1:
         findings.append("workflow auto-disable must trigger ONLY on env.SCRIPT_EXIT == '0'")
 
+    # --- 8b. Workflow hardening: pinned SDK, curl -f on API calls, fatal notification ---
+    # SDK must be pinned (an unpinned install could pull a breaking release).
+    if "oci==2.190.0" not in wf:
+        findings.append("oci_retry.yml must pin the SDK: pip install oci==2.190.0")
+    if re.search(r"pip install oci(?!==)", wf):
+        findings.append("oci_retry.yml must not install an unpinned oci package")
+    # Every curl call in the workflow must fail loudly (-f) so an HTTP error
+    # (e.g. expired GH_PAT -> 401) cannot silently kill the relay chain.
+    for line in wf.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("curl ") or " $(curl" in line or "RESP=$(curl" in line or "ID_TOKEN=$(curl" in line:
+            if "-f" not in line:
+                findings.append(f"curl without -f in oci_retry.yml: {stripped[:100]}")
+    # A fatal-failure notification step must exist (ntfy, no secret needed).
+    if "ntfy.sh" not in wf:
+        findings.append("oci_retry.yml must notify on fatal failure (ntfy step missing)")
+    if "SCRIPT_EXIT != '124'" not in wf or "SCRIPT_EXIT != '0'" not in wf:
+        findings.append("oci_retry.yml notification must trigger on fatal SCRIPT_EXIT (not 0, not 124)")
+
+    # --- 8c. oidc_exchange.sh hardening: every curl needs --max-time + --retry ---
+    exchange = ROOT / "oidc_exchange.sh"
+    if not exchange.is_file():
+        findings.append("oidc_exchange.sh not found")
+    else:
+        ex = exchange.read_text()
+        for line in ex.splitlines():
+            if "curl " in line:
+                if "--max-time" not in line:
+                    findings.append(f"curl without --max-time in oidc_exchange.sh: {line.strip()[:100]}")
+                if "--retry" not in line:
+                    findings.append(f"curl without --retry in oidc_exchange.sh: {line.strip()[:100]}")
+
+    # --- 8d. Watchdog exists with the safe restart rule ---
+    watchdog = ROOT / ".github" / "workflows" / "watchdog.yml"
+    if not watchdog.is_file():
+        findings.append(".github/workflows/watchdog.yml missing (relay chain has no safety net)")
+    else:
+        wd = watchdog.read_text()
+        if "cron:" not in wd and "schedule" not in wd:
+            findings.append("watchdog.yml must run on a schedule")
+        if "120" not in wd:
+            findings.append("watchdog.yml must use the 2-hour (120 min) dead-chain threshold")
+        if "dispatches" not in wd:
+            findings.append("watchdog.yml must be able to dispatch a new run")
+        if "Not restarting" not in wd:
+            findings.append("watchdog.yml must NOT auto-restart after a failed run (notify only)")
+
     # --- 9. Floor: no secrets in source ---
     secret_pats = [
         (re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----"), "PEM private key block"),

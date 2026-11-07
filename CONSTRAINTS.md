@@ -35,6 +35,11 @@ Baca file ini sebelum mengubah `oci_retry.py`, `oidc_exchange.sh`, atau
 | Batas instance | `MAX_A1_INSTANCES` = 1; tidak pernah launch A1 kedua | `python check_invariants.py` | CI, tiap push/PR |
 | Simulasi | Perubahan pada `oci_retry.py` wajib lolos simulasi loop sebelum merge | `python test_retry_simulation.py` | CI, tiap push/PR |
 | Secret di source | Tidak ada pola secret (PEM, token, `client_secret`, `GH_PAT`) di file | `python check_invariants.py` | CI, tiap push/PR |
+| Relay tidak mati diam-diam | `curl` di langkah relay + auto-disable WAJIB pakai `-f` (gagal saat HTTP error) dan `--max-time 30` | `python check_invariants.py` | CI, tiap push/PR |
+| SDK di-pin | `pip install oci==2.190.0` (bukan `oci` tanpa versi) | `python check_invariants.py` | CI, tiap push/PR |
+| curl exchange ber-timeout | `curl` di `oidc_exchange.sh` WAJIB pakai `--max-time` dan `--retry` | `python check_invariants.py` | CI, tiap push/PR |
+| Notifikasi gagal fatal | Ada langkah notifikasi (ntfy) saat `SCRIPT_EXIT` bukan 0 dan bukan 124 | `python check_invariants.py` | CI, tiap push/PR |
+| Watchdog | `watchdog.yml` ada; hanya restart kalau run sukses terakhir >2 jam dan tidak ada run aktif; TIDAK restart kalau run terakhir gagal | `python check_invariants.py` | CI, tiap push/PR |
 
 Alasan tiap angka:
 - 1 launch/siklus: 2 launch beruntun = 429 di panggilan ke-2 TIAP siklus
@@ -48,6 +53,16 @@ Alasan tiap angka:
 - Guard shape-only: allowance Always Free = satu A1 total, apapun namanya.
 - 150 detik poll IP: VNIC masih ATTACHING sesaat setelah launch.
 - 409 + error tak pasti: instance bisa sudah terbuat di antara guard dan launch.
+- Relay pakai `-f`: tanpa `-f`, `curl -s` mengembalikan exit 0 untuk HTTP
+  401/403 — GH_PAT kedaluwarsa = rantai mati diam-diam, tidak ada yang tahu.
+- SDK di-pin 2.190.0: versi yang sudah terbukti jalan (diagnose.yml mem-pin
+  yang sama). Rilis SDK yang merusak akan mematikan semua run sekaligus.
+- curl exchange pakai timeout+retry: tanpa itu, endpoint token yang hang
+  memblokir run sampai job timeout 50 menit.
+- Notifikasi + watchdog: rantai yang mati diam-diam adalah mode gagal paling
+  mahal (kapasitas muncul tapi tidak ada yang mencoba). Watchdog hanya
+  restart kalau run sukses terakhir >2 jam — tidak pernah restart run yang
+  gagal (bisa jadi error auth fatal; restart akan looping).
 
 ## Diukur, belum ditegakkan
 

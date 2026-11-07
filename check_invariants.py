@@ -321,8 +321,8 @@ def main():
         rtree = ast.parse(rsrc, filename=str(resize_py))
         if "CONFIRM_REBOOT" not in rsrc:
             findings.append("resize must refuse to change anything without CONFIRM_REBOOT")
-        if "FREE_TIER_MAX_OCPUS, FREE_TIER_MAX_MEMORY_GBS = 4, 24" not in rsrc:
-            findings.append("resize must cap the target at the Always Free allowance (4 OCPU / 24 GB)")
+        if "FREE_TIER_MAX_OCPUS, FREE_TIER_MAX_MEMORY_GBS = 2, 12" not in rsrc:
+            findings.append("resize must cap the target at the Always Free allowance (2 OCPU / 12 GB)")
         if "BUDGET_S = 2580" not in rsrc:
             findings.append("resize BUDGET_S must be 2580 (43 min)")
         if "sys.exit(124)" not in rsrc:

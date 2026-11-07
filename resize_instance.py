@@ -26,7 +26,7 @@ import oci_retry as base
 
 TARGET_OCPUS = float(os.environ.get("TARGET_OCPUS", "2"))
 TARGET_MEMORY_GBS = float(os.environ.get("TARGET_MEMORY_GBS", "12"))
-FREE_TIER_MAX_OCPUS, FREE_TIER_MAX_MEMORY_GBS = 4, 24  # Always Free A1 allowance; anything above is billed
+FREE_TIER_MAX_OCPUS, FREE_TIER_MAX_MEMORY_GBS = 2, 12  # Always Free A1 allowance since 2026-06-15 (was 4 / 24); above it is billed or rejected
 BUDGET_S = 2580  # 43 min; the workflow also wraps the script in `timeout 2700`
 CONFIRMED = os.environ.get("CONFIRM_REBOOT", "").strip().lower() == "true"
 

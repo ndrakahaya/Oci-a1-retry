@@ -63,7 +63,7 @@ Jalankan workflow **OCI A1 Resize** (`resize.yml`, *Run workflow*) dan centang `
   "Not confirmed" dan ukuran sekarang tercetak di log.
 - Resize juga bisa kena "Out of host capacity". Script mencoba lagi tiap 90 detik sampai 43 menit,
   lalu keluar dengan kode 124. Jalankan lagi nanti.
-- Target di atas jatah Always Free (4 OCPU / 24 GB) ditolak.
+- Target di atas jatah Always Free (2 OCPU / 12 GB sejak 15 Juni 2026) ditolak.
 
 ## Watchdog (opsional)
 

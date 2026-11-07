@@ -47,7 +47,7 @@ Baca file ini sebelum mengubah `oci_retry.py`, `resize_instance.py`,
 | SDK di-pin | `pip install oci==2.190.0` (bukan `oci` tanpa versi) | `python check_invariants.py` | CI, tiap push/PR |
 | curl exchange ber-timeout | `curl` di `oidc_exchange.sh` WAJIB pakai `--max-time` dan `--retry` | `python check_invariants.py` | CI, tiap push/PR |
 | Watchdog | `watchdog.yml` jalan tiap 30 menit (cron `7,37`); restart hanya kalau rantai mati DAN 3 run terakhir TIDAK semuanya gagal (circuit breaker); tidak restart kalau workflow nonaktif atau ada run hidup | `python check_invariants.py` | CI, tiap push/PR |
-| Resize | `resize_instance.py` + `resize.yml`: tanpa `CONFIRM_REBOOT=true` tidak ada yang diubah (exit 2); target di atas jatah Always Free (4 OCPU / 24 GB) ditolak (exit 2); retry kapasitas tiap 90 detik sampai `BUDGET_S` = 2580 (43 menit), habis = exit 124 | `python check_invariants.py` | CI, tiap push/PR |
+| Resize | `resize_instance.py` + `resize.yml`: tanpa `CONFIRM_REBOOT=true` tidak ada yang diubah (exit 2); target di atas jatah Always Free (2 OCPU / 12 GB sejak 15 Juni 2026) ditolak (exit 2); retry kapasitas tiap 90 detik sampai `BUDGET_S` = 2580 (43 menit), habis = exit 124 | `python check_invariants.py` | CI, tiap push/PR |
 
 Alasan tiap angka:
 - 1 launch/siklus: 2 launch beruntun = 429 di panggilan ke-2 TIAP siklus

@@ -15,7 +15,7 @@ import oci
 # ║           2026-11-06: launch small first)            ║
 # ║  Arch   : ARM (Ampere)                               ║
 # ║  Tier   : Oracle Always Free                         ║
-# ║  OS     : Canonical Ubuntu 22.04                     ║
+# ║  OS     : Ubuntu 24.04/22.04 ARM                     ║
 # ╚══════════════════════════════════════════════════════╝
 
 # ─── Configuration ───────────────────────────────────────
@@ -42,6 +42,9 @@ FAULT_DOMAINS = ["FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3"]
 BOOT_VOLUME_SIZE_IN_GBS = 100
 RETRY_INTERVAL = 90  # seconds
 BACKOFF_429 = 300  # seconds to wait after HTTP 429 (TooManyRequests)
+SETUP_TRIES = 5  # tenancy / network / AD / image lookups retry transient errors this many times
+MIN_RUN_BEFORE_RELAY_S = 300  # a 401 after this long = session token expired mid-run -> relay for a fresh one
+T0 = time.time()
 MAX_A1_INSTANCES = 1  # Always Free A1 = 2 OCPU / 12 GB in total -> never more than one instance at launch (a second 1/6 is a resize-phase decision, not a launch decision)
 # ────────────────────────────────────────────────────────
 
@@ -72,6 +75,41 @@ with open(config["key_file"]) as _f:
     # 'str' object has no attribute 'public_key' (run #289).
     _PRIVATE_KEY = load_private_key(_f.read(), None)
 signer = SecurityTokenSigner(_UPST, _PRIVATE_KEY)
+
+
+WIB = datetime.timezone(datetime.timedelta(hours=7))
+
+
+def stamp():
+    """Now as 'UTC | WIB' (the runner clock is UTC, the owner reads WIB)."""
+    now = datetime.datetime.now(datetime.timezone.utc)
+    return f"{now:%Y-%m-%d %H:%M:%S} UTC | {now.astimezone(WIB):%H:%M:%S} WIB"
+
+
+def with_retries(fn, what):
+    """Run a setup call, retrying throttling / 5xx / network errors.
+
+    Any other 4xx is a config or permission problem -> exit 2 (the workflow must NOT relay).
+    Still failing after SETUP_TRIES -> exit 1 (the workflow turns the job red, so a failure
+    e-mail goes out). Before this, ONE transient error during setup killed the whole relay
+    chain silently: exit 1, a green step, and no next job ever dispatched.
+    """
+    for n in range(1, SETUP_TRIES + 1):
+        try:
+            return fn()
+        except oci.exceptions.ServiceError as e:
+            if e.status != 429 and e.status < 500:
+                print(f"🛑 FATAL during {what}: {e.status} {e.code}: {e.message}")
+                sys.exit(2)
+            err = f"{e.status} {e.code}"
+        except Exception as e:
+            err = type(e).__name__
+        if n == SETUP_TRIES:
+            print(f"🛑 {what} failed {SETUP_TRIES} times (last: {err})")
+            sys.exit(1)
+        wait = min(30 * n, 120)
+        print(f"⚠️ {what} failed ({err}); retry {n}/{SETUP_TRIES - 1} in {wait}s")
+        time.sleep(wait)
 
 
 def tenancy_from_token(token):
@@ -195,82 +233,94 @@ def get_ubuntu_arm_image():
     raise Exception("No Ubuntu 22.04/24.04 ARM image found")
 
 
-def create_vcn_and_subnet():
-    network = oci.core.VirtualNetworkClient(config, signer=signer)
+def _covers(rule, port):
+    """True if this ingress rule already opens TCP `port` to 0.0.0.0/0."""
+    if rule.source != "0.0.0.0/0" or rule.protocol not in ("6", "all"):
+        return False
+    rng = rule.tcp_options.destination_port_range if rule.tcp_options else None
+    return rule.protocol == "all" or rng is None or rng.min <= port <= rng.max
 
-    # Check if VCN already exists
-    vcns = network.list_vcns(COMPARTMENT_ID, display_name="retry-vcn").data
+
+def create_vcn_and_subnet():
+    """Idempotent: VCN, internet gateway, default route, ingress ports and subnet are each
+    checked on EVERY run and only the missing ones are created.
+
+    The old version did the gateway / route / ports only inside the "VCN does not exist yet"
+    branch. A run that died half-way through (429, 5xx, timeout) left a VCN that no later run
+    would ever finish: the instance would launch fine but be unreachable. It also replaced the
+    whole ingress list, dropping the default ICMP rules; existing rules are now kept.
+    """
+    network = oci.core.VirtualNetworkClient(config, signer=signer)
+    m = oci.core.models
+    gone = ("TERMINATING", "TERMINATED")
+
+    vcns = [
+        v for v in network.list_vcns(COMPARTMENT_ID, display_name="retry-vcn").data
+        if v.lifecycle_state not in gone
+    ]
     if vcns:
         vcn = vcns[0]
         print(f"Using existing VCN: {vcn.id}")
     else:
         vcn = network.create_vcn(
-            oci.core.models.CreateVcnDetails(
-                compartment_id=COMPARTMENT_ID,
-                display_name="retry-vcn",
-                cidr_block="10.0.0.0/16",
-            )
+            m.CreateVcnDetails(compartment_id=COMPARTMENT_ID, display_name="retry-vcn", cidr_block="10.0.0.0/16")
         ).data
         print(f"Created VCN: {vcn.id}")
 
-        # Create Internet Gateway
+    # A VCN created a moment ago cannot have a gateway yet, so skip the lookup for it.
+    igs = [
+        g for g in network.list_internet_gateways(COMPARTMENT_ID, vcn_id=vcn.id).data
+        if g.lifecycle_state not in gone
+    ] if vcns else []
+    if igs:
+        ig = igs[0]
+    else:
         ig = network.create_internet_gateway(
-            oci.core.models.CreateInternetGatewayDetails(
-                compartment_id=COMPARTMENT_ID,
-                vcn_id=vcn.id,
-                display_name="retry-ig",
-                is_enabled=True,
+            m.CreateInternetGatewayDetails(
+                compartment_id=COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-ig", is_enabled=True
             )
         ).data
+        print(f"Created internet gateway: {ig.id}")
 
-        # Update route table to allow outbound traffic
-        network.update_route_table(
-            vcn.default_route_table_id,
-            oci.core.models.UpdateRouteTableDetails(
-                route_rules=[
-                    oci.core.models.RouteRule(
-                        destination="0.0.0.0/0",
-                        network_entity_id=ig.id,
-                    )
-                ]
+    rt = network.get_route_table(vcn.default_route_table_id).data
+    if not any(r.destination == "0.0.0.0/0" and r.network_entity_id == ig.id for r in rt.route_rules):
+        rules = [r for r in rt.route_rules if r.destination != "0.0.0.0/0"]
+        rules.append(m.RouteRule(destination="0.0.0.0/0", network_entity_id=ig.id))
+        network.update_route_table(rt.id, m.UpdateRouteTableDetails(route_rules=rules))
+        print("Default route 0.0.0.0/0 -> internet gateway set")
+
+    # Open inbound ports: SSH / HTTP / HTTPS / Streamlit (only the ones not open yet)
+    sl_id = vcn.default_security_list_id or network.list_security_lists(COMPARTMENT_ID, vcn_id=vcn.id).data[0].id
+    sl = network.get_security_list(sl_id).data
+    missing = [p for p in (22, 80, 443, 8501) if not any(_covers(r, p) for r in sl.ingress_security_rules)]
+    if missing:
+        added = [
+            m.IngressSecurityRule(
+                protocol="6",
+                source="0.0.0.0/0",
+                tcp_options=m.TcpOptions(destination_port_range=m.PortRange(min=p, max=p)),
+            )
+            for p in missing
+        ]
+        network.update_security_list(
+            sl.id,
+            m.UpdateSecurityListDetails(
+                ingress_security_rules=list(sl.ingress_security_rules) + added,
+                egress_security_rules=sl.egress_security_rules,
             ),
         )
+        print(f"Opened ingress ports {missing} (existing rules kept)")
 
-        # Open inbound ports: SSH / HTTP / HTTPS / Streamlit
-        security_lists = network.list_security_lists(COMPARTMENT_ID, vcn_id=vcn.id).data
-        if security_lists:
-            existing_egress = security_lists[0].egress_security_rules
-            new_ingress = []
-            for port in [22, 80, 443, 8501]:
-                new_ingress.append(
-                    oci.core.models.IngressSecurityRule(
-                        protocol="6",
-                        source="0.0.0.0/0",
-                        tcp_options=oci.core.models.TcpOptions(
-                            destination_port_range=oci.core.models.PortRange(
-                                min=port, max=port
-                            )
-                        ),
-                    )
-                )
-            network.update_security_list(
-                security_lists[0].id,
-                oci.core.models.UpdateSecurityListDetails(
-                    ingress_security_rules=new_ingress,
-                    egress_security_rules=existing_egress,
-                ),
-            )
-
-    # Check if subnet already exists
-    subnets = network.list_subnets(
-        COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-subnet"
-    ).data
+    subnets = [
+        s for s in network.list_subnets(COMPARTMENT_ID, vcn_id=vcn.id, display_name="retry-subnet").data
+        if s.lifecycle_state not in gone
+    ]
     if subnets:
         subnet = subnets[0]
         print(f"Using existing subnet: {subnet.id}")
     else:
         subnet = network.create_subnet(
-            oci.core.models.CreateSubnetDetails(
+            m.CreateSubnetDetails(
                 compartment_id=COMPARTMENT_ID,
                 vcn_id=vcn.id,
                 display_name="retry-subnet",
@@ -312,7 +362,7 @@ def try_create_instance(subnet_id, ad_name, image_id, ocpus, memory_in_gbs, faul
 
 def main():
     global COMPARTMENT_ID
-    COMPARTMENT_ID = resolve_tenancy()
+    COMPARTMENT_ID = with_retries(resolve_tenancy, "tenancy lookup")
 
     found = existing_a1_instance()
     if found:
@@ -321,14 +371,14 @@ def main():
         return
 
     print("Initializing network configuration...")
-    subnet_id = create_vcn_and_subnet()
+    subnet_id = with_retries(create_vcn_and_subnet, "network setup")
 
     print("Fetching availability domain...")
-    ad_name = get_availability_domain()
+    ad_name = with_retries(get_availability_domain, "availability domain lookup")
     print(f"AD: {ad_name}")
 
     print("Fetching Ubuntu ARM image (24.04, fallback 22.04)...")
-    image_id = get_ubuntu_arm_image()
+    image_id = with_retries(get_ubuntu_arm_image, "image lookup")
     print(f"Image ID: {image_id}")
 
     attempt = 0
@@ -336,8 +386,7 @@ def main():
     created = None
     while True:
         attempt += 1
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{now}] Attempt #{attempt} to create instance...")
+        print(f"\n[{stamp()}] Attempt #{attempt} to create instance...")
 
         # Duplicate guard before each cycle: two retry paths run (relay + CLI),
         # so re-check every cycle, not just once at startup.
@@ -365,6 +414,11 @@ def main():
                 print(f"⏳ Rate limited ({detail}); backing off {BACKOFF_429}s")
                 time.sleep(BACKOFF_429)
                 continue
+            if e.status == 401 and time.time() - T0 > MIN_RUN_BEFORE_RELAY_S:
+                # The token passed the startup checks, so this is expiry, not a config error.
+                # Exit 124 = "relay": the next job starts with a fresh token.
+                print(f"🔄 Session token expired mid-run ({detail}); exiting so the next job can take over")
+                sys.exit(124)
             if "capacity" in str(e).lower():
                 print(f"❌ Out of capacity ({ocpus}/{mem}, {fd}), retrying...")
             elif e.status >= 500:

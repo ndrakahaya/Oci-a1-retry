@@ -42,6 +42,8 @@ if [ -z "$CLIENT_ID" ] || [ -z "$CLIENT_SECRET" ]; then
   echo "ERROR: OIDC_CLIENT_IDENTIFIER must be client_id:client_secret"
   exit 1
 fi
+# The secret is registered as "id:secret"; the halves are separate strings to the log masker.
+echo "::add-mask::$CLIENT_SECRET"
 
 OCI_DIR="$HOME/.oci"
 SESS_DIR="$OCI_DIR/sessions/DEFAULT"
@@ -58,19 +60,20 @@ FINGERPRINT=$(openssl pkey -pubin -in "$SESS_DIR/public_key.pem" -outform DER 2>
 echo "key fingerprint: $FINGERPRINT"
 
 # 3. GitHub OIDC JWT (audience https://cloud.oracle.com)
-# --max-time + --retry: a hung/slow token endpoint must not block the run
-# until the 50-min job timeout, and a transient failure gets a second chance.
 if [ -z "${ACTIONS_ID_TOKEN_REQUEST_URL:-}" ] || [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
   echo "ERROR: not running in GitHub Actions (no ACTIONS_ID_TOKEN_REQUEST_URL/TOKEN)"
   exit 1
 fi
-ID_TOKEN=$(curl -sS -f --max-time 30 --retry 3 --retry-delay 5 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+ID_TOKEN=$(curl -s --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 \
+  -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=https%3A%2F%2Fcloud.oracle.com" \
   | python3 -c "import sys,json; print(json.load(sys.stdin)['value'])")
 if [ -z "$ID_TOKEN" ]; then
   echo "ERROR: failed to obtain GitHub OIDC token"
   exit 1
 fi
+
+echo "::add-mask::$ID_TOKEN"
 
 # 4. DEBUG: decode JWT payload claims (shows the actual `sub` so the Trust rule can be fixed precisely)
 PAYLOAD_B64=$(echo "$ID_TOKEN" | cut -d. -f2)
@@ -80,10 +83,8 @@ echo "$PAYLOAD_PADDED" | base64 -d 2>/dev/null | python3 -m json.tool
 echo "--- end claims ---"
 
 # 5. Exchange JWT for OCI UPST at the Identity Domain token endpoint
-# --max-time + --retry: same hardening as step 3 — no hung curl, no
-# single transient failure killing the run.
 EXCHANGE_URL="${DOMAIN}/oauth2/v1/token"
-RESP=$(curl -sS -f --max-time 30 --retry 3 --retry-delay 5 -X POST "$EXCHANGE_URL" \
+RESP=$(curl -s --retry 3 --retry-delay 5 --retry-connrefused --max-time 30 -X POST "$EXCHANGE_URL" \
   -H "Content-Type: application/x-www-form-urlencoded" \
   -u "$CLIENT_ID:$CLIENT_SECRET" \
   --data-urlencode "grant_type=urn:ietf:params:oauth:grant-type:token-exchange" \
@@ -102,6 +103,7 @@ else:
     sys.exit(1)
 "
 UPST=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
+echo "::add-mask::$UPST"
 
 # 6. Write session token + OCI config (security_token auth)
 printf '%s' "$UPST" > "$SESS_DIR/token"

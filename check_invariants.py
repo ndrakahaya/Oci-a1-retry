@@ -2,8 +2,16 @@
 """check_invariants.py — static enforcement of CONSTRAINTS.md for Oci-a1-retry.
 
 Verifies the structural retry invariants in oci_retry.py (AST-based, not regex),
-the relay condition in .github/workflows/oci_retry.yml, and the floor
-(no secrets, no stubs) across the repo.
+the Finish step in .github/workflows/oci_retry.yml, the resize workflow, and the
+floor (no secrets, no stubs) across the repo.
+
+Design this enforces (Claude's 2026-11-07 rewrite, verified by RxSpeed):
+  - relay via the `api()` helper (GH_PAT first, built-in token fallback, 3 rounds)
+  - one Finish step: case on SCRIPT_EXIT (0 = issue + disable, 124 = relay,
+    anything else = red job, no relay)
+  - success notification is a GitHub issue, not ntfy
+  - watchdog restarts the chain unless the last 3 runs all failed (circuit breaker)
+  - setup calls retry transient errors 5x (with_retries); token expiry mid-run relays
 
 Exit codes (same contract as the floor-guard reference):
   0  clean
@@ -36,8 +44,8 @@ def main():
     tree = ast.parse(script.read_text(), filename=str(script))
     src = script.read_text()
 
-    def func(name):
-        for node in ast.walk(tree):
+    def func(name, node_tree=tree):
+        for node in ast.walk(node_tree):
             if isinstance(node, ast.FunctionDef) and node.name == name:
                 return node
         return None
@@ -178,14 +186,41 @@ def main():
         if not loops or not any(isinstance(n, ast.Try) for n in ast.walk(loops[0])):
             findings.append("get_public_ip loop must have a per-poll try/except")
 
-    # --- 8. Workflow: relay ONLY on exit 124, auto-disable ONLY on exit 0 ---
+    # --- 8. Workflow: ONE Finish step, case on SCRIPT_EXIT ---
+    # 0 = issue + disable; 124 = relay; anything else = red job, no relay.
     wf = workflow.read_text()
-    if wf.count("env.SCRIPT_EXIT == '124'") != 1:
-        findings.append("workflow relay must trigger ONLY on env.SCRIPT_EXIT == '124'")
-    if wf.count("env.SCRIPT_EXIT == '0'") != 1:
-        findings.append("workflow auto-disable must trigger ONLY on env.SCRIPT_EXIT == '0'")
+    if 'case "${SCRIPT_EXIT:-unknown}" in' not in wf:
+        findings.append("workflow Finish must use case on SCRIPT_EXIT")
+    if 'echo "SCRIPT_EXIT=$?" >> "$GITHUB_ENV"' not in wf:
+        findings.append("workflow must capture SCRIPT_EXIT into GITHUB_ENV")
+    if "timeout 2700" not in wf:
+        findings.append("workflow must wrap the script in timeout 2700 (45-min budget)")
+    # success branch: notification issue + auto-disable
+    if "gh issue create" not in wf:
+        findings.append("workflow success branch must open a GitHub issue")
+    if "actions/workflows/oci_retry.yml/disable" not in wf:
+        findings.append("workflow success branch must auto-disable")
+    # relay branch: dispatch + confirmation line
+    if "actions/workflows/oci_retry.yml/dispatches" not in wf:
+        findings.append("workflow relay branch must dispatch the next job")
+    if "Next job triggered" not in wf:
+        findings.append("workflow relay branch must print 'Next job triggered'")
+    # failure branch: red job
+    if "exit 1" not in wf:
+        findings.append("workflow must exit 1 on fast failure (red job, no relay)")
+    # api() helper: PAT first, built-in token fallback, 3 rounds, fail loudly
+    if 'for round in 1 2 3' not in wf:
+        findings.append("workflow api() helper must try 3 rounds")
+    if '"$GH_PAT" "$BUILTIN_TOKEN"' not in wf:
+        findings.append("workflow api() must try GH_PAT then the built-in token")
+    if "BUILTIN_TOKEN: ${{ github.token }}" not in wf:
+        findings.append("workflow must pass the built-in token as BUILTIN_TOKEN")
+    if "actions: write" not in wf:
+        findings.append("workflow needs actions: write (built-in relay/disable)")
+    if "issues: write" not in wf:
+        findings.append("workflow needs issues: write (success notification)")
 
-    # --- 8b. Workflow hardening: pinned SDK, curl -f on API calls, fatal notification ---
+    # --- 8b. Workflow hardening: pinned SDK; any curl must fail loudly (-f) ---
     # SDK must be pinned (an unpinned install could pull a breaking release).
     if "oci==2.190.0" not in wf:
         findings.append("oci_retry.yml must pin the SDK: pip install oci==2.190.0")
@@ -198,13 +233,8 @@ def main():
         if stripped.startswith("curl ") or " $(curl" in line or "RESP=$(curl" in line or "ID_TOKEN=$(curl" in line:
             if "-f" not in line:
                 findings.append(f"curl without -f in oci_retry.yml: {stripped[:100]}")
-    # A fatal-failure notification step must exist (ntfy, no secret needed).
-    if "ntfy.sh" not in wf:
-        findings.append("oci_retry.yml must notify on fatal failure (ntfy step missing)")
-    if "SCRIPT_EXIT != '124'" not in wf or "SCRIPT_EXIT != '0'" not in wf:
-        findings.append("oci_retry.yml notification must trigger on fatal SCRIPT_EXIT (not 0, not 124)")
 
-    # --- 8c. oidc_exchange.sh hardening: every curl needs --max-time + --retry ---
+    # --- 8c. oidc_exchange.sh hardening: every curl needs --max-time + --retry; secrets masked ---
     exchange = ROOT / "oidc_exchange.sh"
     if not exchange.is_file():
         findings.append("oidc_exchange.sh not found")
@@ -216,8 +246,11 @@ def main():
                     findings.append(f"curl without --max-time in oidc_exchange.sh: {line.strip()[:100]}")
                 if "--retry" not in line:
                     findings.append(f"curl without --retry in oidc_exchange.sh: {line.strip()[:100]}")
+        for var in ("CLIENT_SECRET", "ID_TOKEN", "UPST"):
+            if f"::add-mask::${var}" not in ex:
+                findings.append(f"oidc_exchange.sh must mask {var} with ::add-mask::")
 
-    # --- 8d. Watchdog exists with the safe restart rule ---
+    # --- 8d. Watchdog: 30-min cron, 3-failure circuit breaker, dispatch on a dead chain ---
     watchdog = ROOT / ".github" / "workflows" / "watchdog.yml"
     if not watchdog.is_file():
         findings.append(".github/workflows/watchdog.yml missing (relay chain has no safety net)")
@@ -225,12 +258,102 @@ def main():
         wd = watchdog.read_text()
         if "cron:" not in wd and "schedule" not in wd:
             findings.append("watchdog.yml must run on a schedule")
-        if "120" not in wd:
-            findings.append("watchdog.yml must use the 2-hour (120 min) dead-chain threshold")
+        if "7,37" not in wd:
+            findings.append("watchdog.yml must run every 30 min (cron 7,37)")
+        if ".[0:3]" not in wd or "failure" not in wd or "timed_out" not in wd:
+            findings.append("watchdog.yml must stop if the last 3 runs all failed/timed out (circuit breaker)")
         if "dispatches" not in wd:
             findings.append("watchdog.yml must be able to dispatch a new run")
-        if "Not restarting" not in wd:
-            findings.append("watchdog.yml must NOT auto-restart after a failed run (notify only)")
+        if '"active"' not in wd:
+            findings.append("watchdog.yml must check the workflow is active before restarting")
+        if "gh api" not in wd:
+            findings.append("watchdog.yml must use gh api (built-in token, no PAT needed)")
+
+    # --- 8e. Setup calls retry transient errors (SETUP_TRIES=5, with_retries) ---
+    if const_int("SETUP_TRIES") != 5:
+        findings.append("SETUP_TRIES must be 5")
+    wr = func("with_retries")
+    if wr is None:
+        findings.append("with_retries() not found")
+    else:
+        wr_src = ast.get_source_segment(src, wr) or ""
+        if "sys.exit(2)" not in wr_src:
+            findings.append("with_retries must exit 2 on a non-retryable 4xx")
+        if "sys.exit(1)" not in wr_src:
+            findings.append("with_retries must exit 1 after SETUP_TRIES failures")
+    if main_fn is not None:
+        main_src = ast.get_source_segment(src, main_fn) or ""
+        for call in ("resolve_tenancy", "create_vcn_and_subnet", "get_availability_domain", "get_ubuntu_arm_image"):
+            if f"with_retries({call}" not in main_src:
+                findings.append(f"main() must call {call} via with_retries")
+
+    # --- 8f. Token expiry mid-run relays (401 after MIN_RUN_BEFORE_RELAY_S) ---
+    if const_int("MIN_RUN_BEFORE_RELAY_S") != 300:
+        findings.append("MIN_RUN_BEFORE_RELAY_S must be 300")
+    if "e.status == 401 and time.time() - T0 > MIN_RUN_BEFORE_RELAY_S" not in src:
+        findings.append("401 after MIN_RUN_BEFORE_RELAY_S must exit 124 (relay, fresh token)")
+    if src.count("sys.exit(124)") < 1:
+        findings.append("script must exit 124 for a relay (timeout or token expiry)")
+
+    # --- 8g. Network setup is idempotent (checked every run, existing rules kept) ---
+    cv = func("create_vcn_and_subnet")
+    if cv is None:
+        findings.append("create_vcn_and_subnet() not found")
+    else:
+        cv_src = ast.get_source_segment(src, cv) or ""
+        for call in ("list_internet_gateways", "get_route_table", "get_security_list", "list_subnets"):
+            if call not in cv_src:
+                findings.append(f"create_vcn_and_subnet must check {call} on every run")
+        if "list(sl.ingress_security_rules) + added" not in cv_src:
+            findings.append("ingress update must keep existing rules (list(...) + added)")
+    if func("_covers") is None:
+        findings.append("_covers() helper not found")
+
+    # --- 8h. Resize workflow: confirm gate, free-tier cap, capacity retries ---
+    resize_py = ROOT / "resize_instance.py"
+    resize_yml = ROOT / ".github" / "workflows" / "resize.yml"
+    if not resize_py.is_file():
+        findings.append("resize_instance.py missing")
+    if not resize_yml.is_file():
+        findings.append(".github/workflows/resize.yml missing")
+    if resize_py.is_file():
+        rsrc = resize_py.read_text()
+        rtree = ast.parse(rsrc, filename=str(resize_py))
+        if "CONFIRM_REBOOT" not in rsrc:
+            findings.append("resize must refuse to change anything without CONFIRM_REBOOT")
+        if "FREE_TIER_MAX_OCPUS, FREE_TIER_MAX_MEMORY_GBS = 4, 24" not in rsrc:
+            findings.append("resize must cap the target at the Always Free allowance (4 OCPU / 24 GB)")
+        if "BUDGET_S = 2580" not in rsrc:
+            findings.append("resize BUDGET_S must be 2580 (43 min)")
+        if "sys.exit(124)" not in rsrc:
+            findings.append("resize must exit 124 when capacity never appears")
+        if "update_instance" not in rsrc:
+            findings.append("resize must use update_instance")
+        if "import oci_retry as base" not in rsrc:
+            findings.append("resize must reuse oci_retry helpers (import oci_retry as base)")
+        # no stubs / swallowed errors in resize either
+        for node in ast.walk(rtree):
+            if isinstance(node, ast.ExceptHandler) and len(node.body) == 1 and isinstance(node.body[0], ast.Pass):
+                findings.append(f"empty except: pass in resize_instance.py at line {node.lineno} (swallowed error)")
+        if re.search(r"raise\s+NotImplementedError|NotImplemented\b", rsrc):
+            findings.append("stub (NotImplemented) in resize_instance.py")
+    if resize_yml.is_file():
+        ry = resize_yml.read_text()
+        if "confirm_reboot" not in ry:
+            findings.append("resize.yml must take a confirm_reboot input")
+        if "oci==2.190.0" not in ry:
+            findings.append("resize.yml must pin the SDK: pip install oci==2.190.0")
+        if "timeout 2700" not in ry:
+            findings.append("resize.yml must wrap the script in timeout 2700")
+
+    # --- 8i. Log lines stamped UTC | WIB ---
+    st = func("stamp")
+    if st is None:
+        findings.append("stamp() not found")
+    else:
+        st_src = ast.get_source_segment(src, st) or ""
+        if "UTC | " not in st_src or "WIB" not in st_src:
+            findings.append("stamp() must format lines as 'UTC | WIB'")
 
     # --- 9. Floor: no secrets in source ---
     secret_pats = [

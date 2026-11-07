@@ -99,10 +99,54 @@ class FakeNetworkClient:
         self._s = state
 
     def list_vcns(self, compartment_id, display_name=None):
-        return _obj(data=[_obj(id="ocid1.vcn.oc1..fake", default_route_table_id="ocid1.routetable.oc1..fake")])
+        return _obj(data=[_obj(
+            id="ocid1.vcn.oc1..fake",
+            lifecycle_state="AVAILABLE",
+            default_route_table_id="ocid1.routetable.oc1..fake",
+            default_security_list_id="ocid1.securitylist.oc1..fake",
+        )])
+
+    def list_internet_gateways(self, compartment_id, vcn_id=None):
+        return _obj(data=[_obj(id="ocid1.internetgateway.oc1..fake", lifecycle_state="AVAILABLE")])
+
+    def get_route_table(self, route_table_id):
+        return _obj(data=_obj(
+            id=route_table_id,
+            route_rules=[_obj(destination="0.0.0.0/0", network_entity_id="ocid1.internetgateway.oc1..fake")],
+        ))
+
+    def get_security_list(self, security_list_id):
+        # One "all" rule covers every port, so create_vcn_and_subnet adds nothing.
+        return _obj(data=_obj(
+            id=security_list_id,
+            ingress_security_rules=[_obj(source="0.0.0.0/0", protocol="all", tcp_options=None)],
+            egress_security_rules=[],
+        ))
+
+    def list_security_lists(self, compartment_id, vcn_id=None):
+        return _obj(data=[_obj(id="ocid1.securitylist.oc1..fake")])
 
     def list_subnets(self, compartment_id, vcn_id=None, display_name=None):
-        return _obj(data=[_obj(id="ocid1.subnet.oc1..fake")])
+        return _obj(data=[_obj(id="ocid1.subnet.oc1..fake", lifecycle_state="AVAILABLE")])
+
+    def create_vcn(self, details):
+        return _obj(data=_obj(
+            id="ocid1.vcn.oc1..new",
+            default_route_table_id="ocid1.routetable.oc1..new",
+            default_security_list_id="ocid1.securitylist.oc1..new",
+        ))
+
+    def create_internet_gateway(self, details):
+        return _obj(data=_obj(id="ocid1.internetgateway.oc1..new", lifecycle_state="AVAILABLE"))
+
+    def update_route_table(self, route_table_id, details):
+        return _obj(data=_obj(id=route_table_id))
+
+    def update_security_list(self, security_list_id, details):
+        return _obj(data=_obj(id=security_list_id))
+
+    def create_subnet(self, details):
+        return _obj(data=_obj(id="ocid1.subnet.oc1..new", lifecycle_state="AVAILABLE"))
 
     def get_vnic(self, vnic_id):
         return _obj(data=_obj(public_ip="1.2.3.4"))
@@ -128,7 +172,7 @@ def install_fake_oci(state):
         "RouteRule", "IngressSecurityRule", "TcpOptions", "PortRange",
         "UpdateSecurityListDetails", "CreateSubnetDetails", "LaunchInstanceDetails",
         "LaunchInstanceShapeConfigDetails", "InstanceSourceViaImageDetails",
-        "CreateVnicDetails",
+        "CreateVnicDetails", "UpdateInstanceDetails", "UpdateInstanceShapeConfigDetails",
     ):
         setattr(oci.core.models, name, FakeModel)
     oci.exceptions = types.ModuleType("oci.exceptions")

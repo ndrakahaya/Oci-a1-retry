@@ -1,0 +1,45 @@
+name: Quality gate
+
+# Enforces CONSTRAINTS.md on every change to the retry script, the workflow,
+# or the gate itself. A merge that fails these checks is rejected.
+# No OCI credentials, no network calls: the simulation stubs the SDK.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'oci_retry.py'
+      - 'check_invariants.py'
+      - 'test_retry_simulation.py'
+      - 'CONSTRAINTS.md'
+      - '.github/workflows/quality-gate.yml'
+      - '.github/workflows/oci_retry.yml'
+  pull_request:
+    paths:
+      - 'oci_retry.py'
+      - 'check_invariants.py'
+      - 'test_retry_simulation.py'
+      - 'CONSTRAINTS.md'
+      - '.github/workflows/quality-gate.yml'
+      - '.github/workflows/oci_retry.yml'
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Static invariant checks (CONSTRAINTS.md)
+        run: python check_invariants.py
+
+      - name: Retry-loop simulation (behavioural proof)
+        run: python test_retry_simulation.py

@@ -68,13 +68,27 @@ def main():
         if got != want:
             findings.append(f"{name} must be {want}, got {got}")
 
-    # --- 2. SHAPE_LADDER: exactly 2 rungs; FAULT_DOMAINS: exactly 3 ---
+    # --- 2. SHAPE_LADDER: exactly 2 rungs; FAULT_DOMAINS: FD-1/2/3 + None, odd length, >= half unpinned ---
     ladder = const_assign("SHAPE_LADDER")
     if not (isinstance(ladder, ast.List) and len(ladder.elts) == 2):
         findings.append("SHAPE_LADDER must have exactly 2 rungs (2/12 and 1/6)")
     fds = const_assign("FAULT_DOMAINS")
-    if not (isinstance(fds, ast.List) and len(fds.elts) == 3):
-        findings.append("FAULT_DOMAINS must have exactly 3 entries")
+    fd_vals = [e.value for e in fds.elts if isinstance(e, ast.Constant)] if isinstance(fds, ast.List) else None
+    if fd_vals is None or len(fd_vals) != len(fds.elts):
+        findings.append("FAULT_DOMAINS must be a list of string / None literals")
+    else:
+        for want in ("FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3"):
+            if want not in fd_vals:
+                findings.append(f"FAULT_DOMAINS must contain {want}")
+        if None not in fd_vals:
+            findings.append("FAULT_DOMAINS must contain None (an unpinned call: Oracle picks the fault domain)")
+        if fd_vals.count(None) * 2 < len(fd_vals):
+            findings.append("FAULT_DOMAINS: unpinned (None) entries must be at least half of the list")
+        if len(fd_vals) % 2 == 0:
+            findings.append(
+                "FAULT_DOMAINS length must be odd (shape index is launch_no % 2; an even length "
+                "leaves some shape x fault-domain pairs untested)"
+            )
 
     # --- 3. One launch per cycle: exactly one try_create_instance call in main's loop ---
     main_fn = func("main")

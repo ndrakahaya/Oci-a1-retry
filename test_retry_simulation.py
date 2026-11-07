@@ -6,7 +6,7 @@ canned API responses (Out of capacity, 429, success, 409, fatal 401, network
 error). Proves the CONSTRAINTS.md invariants by behaviour, not by reading logs:
 
   - exactly 1 launch per cycle, shapes alternate 2/12 <-> 1/6
-  - fault domains rotate across 3 FDs
+  - fault domains: unpinned (Oracle picks) interleaved with FD-1, FD-2, FD-3 (odd list length)
   - 429 costs a 300s backoff; capacity costs a 90s retry
   - 409 / uncertain network error re-checks for an existing instance
   - fatal 401 exits 2 (never relay); existing instance stops the loop
@@ -252,7 +252,8 @@ def scenario_alternation():
     shapes = [(o, m) for o, m, _ in state["launches"]]
     check("shapes alternate 2/12,1/6,...", shapes == [(2, 12), (1, 6)] * 3 + [(2, 12)], f"got {shapes}")
     fds = [f for _, _, f in state["launches"]]
-    check("FDs rotate 1,2,3,1,2,3,1", fds == ["FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3"] * 2 + ["FAULT-DOMAIN-1"], f"got {fds}")
+    check("FDs: any, FD-1, any, FD-2, any, FD-3, any",
+          fds == [None, "FAULT-DOMAIN-1", None, "FAULT-DOMAIN-2", None, "FAULT-DOMAIN-3", None], f"got {fds}")
     check("all sleeps are 90s retry", all(s == 90 for s in state["sleeps"]), f"got {state['sleeps']}")
     check("no 300s backoff", 300 not in state["sleeps"])
     check("success printed", "Success! Instance created" in out)
@@ -320,9 +321,23 @@ def scenario_guard_at_startup():
     check("already-exists printed", "already exists" in out)
 
 
+def scenario_pair_coverage():
+    print("scenario: every (shape, fault-domain mode) pair is tried within 14 calls")
+    state = fresh_state([("capacity",)] * 13 + [("success",)])
+    code, out = run_main(state)
+    check("exit 0 on success", code == 0, f"got {code}")
+    check("14 launch calls", len(state["launches"]) == 14, f"got {len(state['launches'])}")
+    pairs = {((o, m), f) for o, m, f in state["launches"]}
+    want = {(s, f) for s in ((2, 12), (1, 6)) for f in (None, "FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3")}
+    check("all 8 pairs (2 shapes x unpinned/FD-1/FD-2/FD-3) covered", pairs == want, f"missing {want - pairs}")
+    unpinned = sum(1 for _, _, f in state["launches"] if f is None)
+    check("8 of 14 calls are unpinned (Oracle picks the fault domain)", unpinned == 8, f"got {unpinned}")
+
+
 def main():
     scenarios = [
         scenario_alternation,
+        scenario_pair_coverage,
         scenario_429_backoff,
         scenario_409_existing,
         scenario_fatal_401,

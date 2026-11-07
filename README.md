@@ -14,7 +14,7 @@ VCN `retry-vcn` + subnet `retry-subnet` dibuat atau dilengkapi otomatis.
    GitHub dengan session token Oracle (`oidc_exchange.sh`), lalu menjalankan `oci_retry.py`
    maksimal 45 menit (token Oracle berlaku sekitar 60 menit).
 2. `oci_retry.py` mencoba **satu** `launch_instance` tiap 90 detik. Ukuran bergantian
-   2 OCPU / 12 GB dan 1 OCPU / 6 GB, fault domain berputar 1 → 2 → 3. "Out of capacity" berarti
+   2 OCPU / 12 GB dan 1 OCPU / 6 GB, fault domain: 4 dari 7 panggilan tidak mengunci FD (`ANY-FD`, Oracle memilih sendiri sambil mengoptimalkan kapasitas), sisanya mengunci FD-1, FD-2, FD-3 bergantian. "Out of capacity" berarti
    coba lagi. Satu panggilan per siklus karena dua panggilan beruntun selalu kena 429 (run #308).
 3. Sebelum tiap siklus script mengecek apakah sudah ada instance A1 (nama apa pun). Kalau ada, berhenti.
 4. Setelah 45 menit script keluar dengan kode 124 dan langkah *Finish* memicu job berikutnya

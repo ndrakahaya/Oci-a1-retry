@@ -36,9 +36,16 @@ INSTANCE_NAME = "agent-box"
 # back: that drew a 429 on the 2nd call EVERY cycle (run #308: 7 attempts per 45 min
 # instead of ~30, because each 429 costs BACKOFF_429, and the 1/6 rung never got evaluated).
 SHAPE_LADDER = [(2, 12), (1, 6)]
-# Fault domains (Singapore has 1 AD but 3 fault domains). Rotate per launch call; with
-# 2 shapes x 3 fault domains every (shape, fault domain) pair is hit once per 6 calls (~9 min).
-FAULT_DOMAINS = ["FAULT-DOMAIN-1", "FAULT-DOMAIN-2", "FAULT-DOMAIN-3"]
+# Fault domains (Singapore has 1 AD but 3 fault domains). None = pin no fault domain: Oracle
+# then picks one itself, "optimizing for available capacity in the availability domain"
+# (Oracle docs, Regions and Availability Domains), so such a call lands wherever ANY fault
+# domain has room, while a pinned call only works if THAT fault domain has room. Oracle's
+# "Resolving Out of Host Capacity error" page recommends not specifying one. The pinned
+# entries stay as a hedge in case Oracle's own pick is poor.
+# The length MUST be odd: the shape index is launch_no % 2, and with an even length some
+# (shape, fault domain) pairs would never meet. 7 entries: 4 of every 7 calls are unpinned,
+# each pinned fault domain gets a call every 7 (~10 min), all pairs occur within 14 calls.
+FAULT_DOMAINS = [None, "FAULT-DOMAIN-1", None, "FAULT-DOMAIN-2", None, "FAULT-DOMAIN-3", None]
 BOOT_VOLUME_SIZE_IN_GBS = 100
 RETRY_INTERVAL = 90  # seconds
 BACKOFF_429 = 300  # seconds to wait after HTTP 429 (TooManyRequests)
@@ -401,10 +408,12 @@ def main():
         ocpus, mem = SHAPE_LADDER[launch_no % len(SHAPE_LADDER)]
         fd = FAULT_DOMAINS[launch_no % len(FAULT_DOMAINS)]
         launch_no += 1
-        print(f"  Trying {ocpus} OCPU / {mem} GB on {fd}...")
+        where = fd or "ANY-FD"  # ANY-FD = no fault domain pinned, Oracle picks
+        print(f"  Trying {ocpus} OCPU / {mem} GB on {where}...")
         try:
             created = try_create_instance(subnet_id, ad_name, image_id, ocpus, mem, fd)
-            print(f"\n✅ Success! Instance created ({ocpus} OCPU / {mem} GB, {fd})")
+            print(f"\n✅ Success! Instance created ({ocpus} OCPU / {mem} GB, {where})")
+            print(f"   Fault domain: {getattr(created, 'fault_domain', None) or fd or 'unknown'}")
             print(f"   ID: {created.id}")
             print(f"   State: {created.lifecycle_state}")
             break
@@ -420,7 +429,7 @@ def main():
                 print(f"🔄 Session token expired mid-run ({detail}); exiting so the next job can take over")
                 sys.exit(124)
             if "capacity" in str(e).lower():
-                print(f"❌ Out of capacity ({ocpus}/{mem}, {fd}), retrying...")
+                print(f"❌ Out of capacity ({ocpus}/{mem}, {where}), retrying...")
             elif e.status >= 500:
                 print(f"❌ Oracle server error ({detail}), retrying...")
             elif e.status in (400, 401, 403, 404) or e.code in (

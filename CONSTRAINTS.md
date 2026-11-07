@@ -25,7 +25,7 @@ Baca file ini sebelum mengubah `oci_retry.py`, `resize_instance.py`,
 |---------|--------|----------------|----------|
 | Siklus launch | Tepat 1 panggilan `launch_instance` per siklus; tidak pernah 2 beruntun | `python check_invariants.py` | CI, tiap push/PR |
 | Alternasi shape | Shape bergantian 2/12 ↔ 1/6 tiap siklus (`SHAPE_LADDER`, `launch_no % len`) | `python check_invariants.py` | CI, tiap push/PR |
-| Rotasi fault domain | Fault domain berotasi di 3 FD (`FAULT_DOMAINS`, `launch_no % len`) | `python check_invariants.py` | CI, tiap push/PR |
+| Rotasi fault domain | `FAULT_DOMAINS` (`launch_no % len`): minimal separuh entri `None` (tanpa kunci FD, Oracle memilih sendiri), plus FD-1, FD-2, FD-3; panjang daftar ganjil | `python check_invariants.py` | CI, tiap push/PR |
 | Interval retry | `RETRY_INTERVAL` 90 detik antar siklus; `BACKOFF_429` 300 detik setelah 429 | `python check_invariants.py` | CI, tiap push/PR |
 | Budget run | `timeout 2700` (45 menit) di workflow; keluar 124 = relay | `python check_invariants.py` | CI, tiap push/PR |
 | Finish step | SATU langkah `Finish`, `case` pada `SCRIPT_EXIT`: 0 = issue + disable, 124 = relay, lain = job merah (`exit 1`), tanpa relay | `python check_invariants.py` | CI, tiap push/PR |
@@ -53,7 +53,16 @@ Alasan tiap angka:
 - 1 launch/siklus: 2 launch beruntun = 429 di panggilan ke-2 TIAP siklus
   (run #308: 7 attempt/45 mnt, bukan ~30; rung 1/6 tidak pernah teruji).
 - Alternasi 2/12↔1/6: 1/6 muat di lebih banyak host daripada 2/12.
-- Rotasi 3 FD: 2 shape × 3 FD = tiap pasangan kena 1× per 6 panggilan (~9 mnt).
+- Fault domain: panggilan tanpa FD (`ANY-FD`) membiarkan Oracle memilih FD sambil
+  "optimizing for available capacity in the availability domain" (dokumen Regions and
+  Availability Domains), jadi menang kalau FD mana pun punya host kosong; panggilan yang
+  mengunci FD hanya menang kalau FD itu yang punya. Halaman Oracle "Resolving Out of Host
+  Capacity error" juga menyarankan tidak menentukan FD. Cara Oracle memilih tidak
+  didokumentasikan, jadi entri FD-1/2/3 tetap ada sebagai lindung nilai kalau pilihan
+  Oracle ternyata buruk. Panjang daftar harus ganjil: indeks shape = `launch_no % 2`,
+  jadi panjang genap membuat sebagian pasangan (shape, FD) tidak pernah teruji. Dengan 7
+  entri: 4 dari 7 panggilan tanpa FD, tiap FD dikunci 1× per 7 panggilan (~10 mnt), semua
+  pasangan muncul dalam 14 panggilan (~21 mnt).
 - 90 detik: 30 attempt per run 2700 detik (Claude, run #311: gap 92,5 detik).
 - 300 detik backoff 429: cukup lama supaya throttle Oracle reda.
 - Relay hanya 124: exit lain = auth/config rusak; relay akan memutar loop
